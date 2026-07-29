@@ -19,16 +19,24 @@
  */
 enum class InitStage : uint8_t
 {
-    PreInit     = 0,     // 预初始化
-    PreThread   = 1,     // 预初始化线程
-    EarlyInit   = 2,     // 早期初始化
-    EarlyThread = 3,     // 早期初始化线程
-    MidInit     = 4,     // 中期初始化
-    MidThread   = 5,     // 中期初始化线程
-    LateInit    = 6,     // 后期初始化
-    LateThread  = 7,     // 后期初始化线程
-    AppInit     = 8,     // 应用初始化
-    AppThread   = 9,     // 应用初始化线程
+    PreInit   = 0,
+    EarlyInit = 1,
+    MidInit   = 2,
+    LateInit  = 3,
+    AppInit   = 4,
+};
+
+/**
+ * @brief 线程阶段
+ *
+ */
+enum class ThreadStage : uint8_t
+{
+    PreThread   = 0,
+    EarlyThread = 1,
+    MidThread   = 2,
+    LateThread  = 3,
+    AppThread   = 4,
 };
 
 /**
@@ -67,12 +75,29 @@ struct InitEntry
  * 通过链接段收集形成初始化表，启动器遍历执行。
  *
  * @param fn       初始化函数（符合 InitFunc 签名）
- * @param stage_   InitStage 枚举值（不带 InitStage::）
- * @param level_   InitLevel 枚举值（不带 InitLevel::）
+ * @param stage_   InitStage 枚举值
+ * @param level_   InitLevel 枚举值
  * @param name_    组件标识，打印用
  */
 #define REGISTER_INIT(fn, stage_, level_, name_)                                \
     static const InitEntry kInitEntry_##fn                                      \
     __attribute__((used, __section__(".user_init"))) = {                        \
         fn, InitStage::stage_, InitLevel::level_, name_                         \
+}
+
+/**
+ * @brief 注册线程项
+ *
+ * 每个线程用此宏声明一个 InitEntry（存放于 .user_thread 段），
+ * 启动器遍历执行。
+ *
+ * @param fn       线程函数（符合 InitFunc 签名）
+ * @param stage_   ThreadStage 枚举值
+ * @param level_   InitLevel 枚举值
+ * @param name_    组件标识，打印用
+ */
+#define REGISTER_THREAD(fn, stage_, level_, name_)                                  \
+    static const InitEntry kThreadEntry_##fn                                        \
+    __attribute__((used, __section__(".user_thread"))) = {                          \
+        fn, static_cast<InitStage>(ThreadStage::stage_), InitLevel::level_, name_   \
 }

@@ -1,12 +1,12 @@
 /**
  * @file Init_entry.cpp
  * @author qingyu
- * @brief 
+ * @brief
  * @version 0.1
  * @date 2026-07-20
- * 
+ *
  * @copyright Copyright (c) 2026
- * 
+ *
  */
 
 #include "Init_entry.hpp"
@@ -18,37 +18,46 @@
 
 LOG_MODULE_REGISTER(init, LOG_LEVEL_INF);
 
-// 链接段边界，由 linker/tflm_init.ld 定义
-extern const InitEntry __user_init_start[];
-extern const InitEntry __user_init_end[];
-
-static constexpr struct 
+static constexpr struct
 {
-    InitStage stage;
-    const char* name;
-} 
-// 线程分三级启动——部分线程依赖其他线程先就绪（如 CAN TX 需早于其他线程）
-StageMap[] {
-    {InitStage::PreInit,     "PreInit"},
-    {InitStage::PreThread,   "PreThread"},
-    {InitStage::EarlyInit,   "EarlyInit"},
-    {InitStage::EarlyThread, "EarlyThread"},
-    {InitStage::MidInit,     "MidInit"},
-    {InitStage::MidThread,   "MidThread"},
-    {InitStage::LateInit,    "LateInit"},
-    {InitStage::LateThread,  "LateThread"},
-    {InitStage::AppInit,     "AppInit"},
-    {InitStage::AppThread,   "AppThread"},
+    InitStage    stage;
+    const char*  name;
+}
+kInitStageMap[] {
+    {InitStage::PreInit,   "PreInit"},
+    {InitStage::EarlyInit, "EarlyInit"},
+    {InitStage::MidInit,   "MidInit"},
+    {InitStage::LateInit,  "LateInit"},
+    {InitStage::AppInit,   "AppInit"},
 };
 
-/**
- * @brief 根据阶段枚举查找阶段名称
- * @param stage 阶段枚举值
- * @return 阶段名字符串，未找到返回 "?"
- */
+static constexpr struct
+{
+    ThreadStage  stage;
+    const char*  name;
+}
+kThreadStageMap[] {
+    {ThreadStage::PreThread,   "PreThread"},
+    {ThreadStage::EarlyThread, "EarlyThread"},
+    {ThreadStage::MidThread,   "MidThread"},
+    {ThreadStage::LateThread,  "LateThread"},
+    {ThreadStage::AppThread,   "AppThread"},
+};
+
 static const char* StageName(InitStage stage)
 {
-    for (const auto& m : StageMap)
+    for (const auto& m : kInitStageMap)
+    {
+        if (m.stage == stage) {
+            return m.name;
+        }
+    }
+    return "unknown";
+}
+
+static const char* StageName(ThreadStage stage)
+{
+    for (const auto& m : kThreadStageMap)
     {
         if (m.stage == stage) {
             return m.name;
@@ -60,23 +69,13 @@ static const char* StageName(InitStage stage)
 static constexpr struct FailAction {
     InitLevel  level;
     bool       halt;
-} 
+}
 kFailActions[] {
     {InitLevel::High, true},
     {InitLevel::Mid,  false},
     {InitLevel::Low,  false},
 };
 
-/**
- * @brief 处理初始化项失败
- *
- * 根据等级决定行为：
- *   High  报错并挂起系统
- *   Mid   报错继续
- *   Low   告警继续
- *
- * @param entry 失败的初始化项
- */
 static void HandleInitFail(const InitEntry& entry)
 {
     bool halt = false;
@@ -101,21 +100,34 @@ static void HandleInitFail(const InitEntry& entry)
     }
 }
 
-/**
- * @brief 运行指定阶段的所有初始化项
- *
- * 遍历 .user_init 段中所有 InitEntry，
- * 仅执行 stage 匹配的项，按链接顺序。
- *
- * @param stage 待执行的初始化阶段
- */
 static void RunStage(InitStage stage)
 {
-    LOG_ERR("==== stage: %s ====", StageName(stage));
+    extern const InitEntry __user_init_start[], __user_init_end[];
+
+    LOG_ERR("==== init stage: %s ====", StageName(stage));
 
     for (const InitEntry* e = __user_init_start; e < __user_init_end; ++e)
     {
-        if (e->stage != stage) {
+        if (e->stage != static_cast<InitStage>(stage)) {
+            continue;
+        }
+        LOG_ERR("%s", e->name);
+        if (!e->func()) {
+            HandleInitFail(*e);
+        }
+    }
+    printk("\n");
+}
+
+static void RunStage(ThreadStage stage)
+{
+    extern const InitEntry __user_thread_start[], __user_thread_end[];
+
+    LOG_ERR("==== thread stage: %s ====", StageName(stage));
+
+    for (const InitEntry* e = __user_thread_start; e < __user_thread_end; ++e)
+    {
+        if (static_cast<ThreadStage>(e->stage) != stage) {
             continue;
         }
         LOG_ERR("%s", e->name);
@@ -140,32 +152,29 @@ void System_Startup(void)
 
     RunStage(InitStage::PreInit);
     k_msleep(kNormalStageDelayMs);
-    RunStage(InitStage::PreThread);
+    RunStage(ThreadStage::PreThread);
     k_msleep(kNormalStageDelayMs);
     EXEC_BUZZER_SHORT();
 
     RunStage(InitStage::EarlyInit);
     k_msleep(kNormalStageDelayMs);
-    RunStage(InitStage::EarlyThread);
+    RunStage(ThreadStage::EarlyThread);
     k_msleep(kNormalStageDelayMs);
     EXEC_BUZZER_SHORT();
 
     RunStage(InitStage::MidInit);
     k_msleep(kNormalStageDelayMs);
-    RunStage(InitStage::MidThread);
+    RunStage(ThreadStage::MidThread);
     k_msleep(kNormalStageDelayMs);
     EXEC_BUZZER_SHORT();
 
     RunStage(InitStage::LateInit);
     k_msleep(kNormalStageDelayMs);
-    RunStage(InitStage::LateThread);
+    RunStage(ThreadStage::LateThread);
     k_msleep(kNormalStageDelayMs);
     EXEC_BUZZER_SHORT();
 
     RunStage(InitStage::AppInit);
     k_msleep(kNormalStageDelayMs);
-    RunStage(InitStage::AppThread);
+    RunStage(ThreadStage::AppThread);
 }
-
-
-
