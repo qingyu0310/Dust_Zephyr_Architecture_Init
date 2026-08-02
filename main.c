@@ -15,5 +15,9 @@
 int main(void)
 {
     System_Startup();
-    while (1) { k_msleep(1000); }
+	
+    while (1) 
+	{ 
+		k_msleep(1000); 
+	}
 }
