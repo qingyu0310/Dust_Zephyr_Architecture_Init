@@ -12,59 +12,8 @@
 #include "Init_entry.hpp"
 #include "System_startup.h"
 #include "buzzer.hpp"
-#include "zephyr/sys/printk.h"
+#include "log.hpp"
 #include <zephyr/kernel.h>
-#include <zephyr/logging/log.h>
-
-LOG_MODULE_REGISTER(init, LOG_LEVEL_INF);
-
-static constexpr struct
-{
-    InitStage    stage;
-    const char*  name;
-}
-kInitStageMap[] {
-    {InitStage::PreInit,   "PreInit"},
-    {InitStage::EarlyInit, "EarlyInit"},
-    {InitStage::MidInit,   "MidInit"},
-    {InitStage::LateInit,  "LateInit"},
-    {InitStage::AppInit,   "AppInit"},
-};
-
-static constexpr struct
-{
-    ThreadStage  stage;
-    const char*  name;
-}
-kThreadStageMap[] {
-    {ThreadStage::PreThread,   "PreThread"},
-    {ThreadStage::EarlyThread, "EarlyThread"},
-    {ThreadStage::MidThread,   "MidThread"},
-    {ThreadStage::LateThread,  "LateThread"},
-    {ThreadStage::AppThread,   "AppThread"},
-};
-
-static const char* StageName(InitStage stage)
-{
-    for (const auto& m : kInitStageMap)
-    {
-        if (m.stage == stage) {
-            return m.name;
-        }
-    }
-    return "unknown";
-}
-
-static const char* StageName(ThreadStage stage)
-{
-    for (const auto& m : kThreadStageMap)
-    {
-        if (m.stage == stage) {
-            return m.name;
-        }
-    }
-    return "unknown";
-}
 
 static constexpr struct FailAction {
     InitLevel  level;
@@ -88,10 +37,11 @@ static void HandleInitFail(const InitEntry& entry)
         }
     }
 
-    if (halt) {
-        LOG_ERR("init %s failed, system halted", entry.name);
+    // 失败横幅：高级红色 ERR、中级/低级橘色 WRN（打印在 halt 判断前，High 失败也能看到）
+    if (entry.level == InitLevel::High) {
+        DUST_LOG_ERR("[boot] %s fail", entry.name);
     } else {
-        LOG_WRN("init %s failed", entry.name);
+        DUST_LOG_WRN("[boot] %s fail", entry.name);
     }
 
     if (halt) {
@@ -100,42 +50,77 @@ static void HandleInitFail(const InitEntry& entry)
     }
 }
 
+/**
+ * @brief 初始化阶段名（启动横幅用）
+ */
+static const char* StageName(InitStage stage)
+{
+    switch (stage)
+    {
+        case InitStage::PreInit:   return "PreInit";
+        case InitStage::EarlyInit: return "EarlyInit";
+        case InitStage::MidInit:   return "MidInit";
+        case InitStage::LateInit:  return "LateInit";
+        case InitStage::AppInit:   return "AppInit";
+        default:                   return "?";
+    }
+}
+
+/**
+ * @brief 线程阶段名（启动横幅用）
+ */
+static const char* StageName(ThreadStage stage)
+{
+    switch (stage)
+    {
+        case ThreadStage::PreThread:   return "PreThread";
+        case ThreadStage::EarlyThread: return "EarlyThread";
+        case ThreadStage::MidThread:   return "MidThread";
+        case ThreadStage::LateThread:  return "LateThread";
+        case ThreadStage::AppThread:   return "AppThread";
+        default:                       return "?";
+    }
+}
+
 static void RunStage(InitStage stage)
 {
     extern const InitEntry __user_init_start[], __user_init_end[];
-
-    LOG_ERR("==== init stage: %s ====", StageName(stage));
 
     for (const InitEntry* e = __user_init_start; e < __user_init_end; ++e)
     {
         if (e->stage != static_cast<InitStage>(stage)) {
             continue;
         }
-        LOG_ERR("%s", e->name);
         if (!e->func()) {
             HandleInitFail(*e);
+            continue;                      				// 失败：不打印初始化提示
         }
+        DUST_LOG_INF("[boot] %s init", e->name);   // 谁在初始化
     }
-    printk("\n");
+
+    // 阶段横幅：阶段内条目全部执行完再打印（此时 DUST_LOG 已初始化，PreInit 完成也能出），
+    // 表示哪个阶段初始化完成
+    DUST_LOG_OK("=====     [boot] %s ok     =====\n", StageName(stage));
 }
 
 static void RunStage(ThreadStage stage)
 {
     extern const InitEntry __user_thread_start[], __user_thread_end[];
 
-    LOG_ERR("==== thread stage: %s ====", StageName(stage));
-
     for (const InitEntry* e = __user_thread_start; e < __user_thread_end; ++e)
     {
         if (static_cast<ThreadStage>(e->stage) != stage) {
             continue;
         }
-        LOG_ERR("%s", e->name);
         if (!e->func()) {
             HandleInitFail(*e);
+            continue;                      					// 失败：不打印线程启动提示
         }
+        DUST_LOG_INF("[boot] %s start", e->name);   	// 谁的线程启动
     }
-    printk("\n");
+
+    // 阶段横幅：线程阶段全部启动完再打印
+    DUST_LOG_OK("=====     [boot] %s ok     =====\n", StageName(stage));
 }
 
 /**
