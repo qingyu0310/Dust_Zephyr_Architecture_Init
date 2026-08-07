@@ -40,13 +40,22 @@ enum class ThreadStage : uint8_t
 };
 
 /**
- * @brief 初始化等级
+ * @brief 初始化等级（优先级：同一阶段内 High→Mid→Low）
  */
 enum class InitLevel : uint8_t
 {
     High = 0,
     Mid  = 1,
     Low  = 2,
+};
+
+/**
+ * @brief 初始化失败策略（与优先级 InitLevel 独立，每条目自行声明）
+ */
+enum class InitFailPolicy : uint8_t
+{
+    HaltOnFail     = 0,   // 失败停机
+    ContinueOnFail = 1,   // 失败警告后继续
 };
 
 /**
@@ -62,10 +71,11 @@ using InitFunc = bool (*)();
  */
 struct InitEntry
 {
-    InitFunc     func;      // 初始化函数
-    InitStage    stage;     // 所属阶段
-    InitLevel    level;     // 高级/中级/低级
-    const char*  name;      // 组件名，调试用
+    InitFunc          func;      // 初始化函数
+    InitStage         stage;     // 所属阶段
+    InitLevel         level;     // 优先级：高级/中级/低级（仅 Init 用）
+    InitFailPolicy    fail;      // 失败策略：停机/继续（仅 Init 用）
+    const char*       name;      // 组件名，调试用
 };
 
 /**
@@ -79,10 +89,10 @@ struct InitEntry
  * @param level_   InitLevel 枚举值
  * @param name_    组件标识，打印用
  */
-#define REGISTER_INIT(fn, stage_, level_, name_)                                \
-    static const InitEntry kInitEntry_##fn                                      \
-    __attribute__((used, __section__(".user_init"))) = {                        \
-        fn, InitStage::stage_, InitLevel::level_, name_                         \
+#define REGISTER_INIT(fn, stage_, level_, fail_, name_)                        \
+    static const InitEntry kInitEntry_##fn                                     \
+    __attribute__((used, __section__(".user_init"))) = {                       \
+        fn, InitStage::stage_, InitLevel::level_, InitFailPolicy::fail_, name_ \
 }
 
 /**
@@ -96,8 +106,9 @@ struct InitEntry
  * @param level_   InitLevel 枚举值
  * @param name_    组件标识，打印用
  */
-#define REGISTER_THREAD(fn, stage_, level_, name_)                                  \
-    static const InitEntry kThreadEntry_##fn                                        \
-    __attribute__((used, __section__(".user_thread"))) = {                          \
-        fn, static_cast<InitStage>(ThreadStage::stage_), InitLevel::level_, name_   \
+#define REGISTER_THREAD(fn, stage_, name_)                                     \
+    static const InitEntry kThreadEntry_##fn                                   \
+    __attribute__((used, __section__(".user_thread"))) = {                     \
+        fn, static_cast<InitStage>(ThreadStage::stage_), InitLevel::High,      \
+        InitFailPolicy::ContinueOnFail, name_                                  \
 }

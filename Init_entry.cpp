@@ -15,30 +15,12 @@
 #include "log.hpp"
 #include <zephyr/kernel.h>
 
-static constexpr struct FailAction {
-    InitLevel  level;
-    bool       halt;
-}
-kFailActions[] {
-    {InitLevel::High, true},
-    {InitLevel::Mid,  false},
-    {InitLevel::Low,  false},
-};
-
 static void HandleInitFail(const InitEntry& entry)
 {
-    bool halt = false;
+    bool halt = (entry.fail == InitFailPolicy::HaltOnFail);
 
-    for (const auto& a : kFailActions)
-    {
-        if (a.level == entry.level) {
-            halt = a.halt;
-            break;
-        }
-    }
-
-    // 失败横幅：高级红色 ERR、中级/低级橘色 WRN（打印在 halt 判断前，High 失败也能看到）
-    if (entry.level == InitLevel::High) {
+    // 失败横幅：HaltOnFail 红色 ERR、ContinueOnFail 橘色 WRN
+    if (halt) {
         DUST_LOG_ERR("[boot] %s fail", entry.name);
     } else {
         DUST_LOG_WRN("[boot] %s fail", entry.name);
@@ -49,6 +31,15 @@ static void HandleInitFail(const InitEntry& entry)
         while (1) {}
     }
 }
+
+/**
+ * @brief 阶段内执行顺序：同一阶段先跑 High、再 Mid、最后 Low
+ */
+static constexpr InitLevel kLevelOrder[] = {
+    InitLevel::High,
+    InitLevel::Mid,
+    InitLevel::Low,
+};
 
 /**
  * @brief 初始化阶段名（启动横幅用）
@@ -86,16 +77,22 @@ static void RunStage(InitStage stage)
 {
     extern const InitEntry __user_init_start[], __user_init_end[];
 
-    for (const InitEntry* e = __user_init_start; e < __user_init_end; ++e)
+    for (const InitLevel level : kLevelOrder)
     {
-        if (e->stage != static_cast<InitStage>(stage)) {
-            continue;
+        for (const InitEntry* e = __user_init_start; e < __user_init_end; ++e)
+        {
+            if (e->stage != static_cast<InitStage>(stage)) {
+                continue;
+            }
+            if (e->level != level) {
+                continue;
+            }
+            if (!e->func()) {
+                HandleInitFail(*e);
+                continue;                      				// 失败：不打印初始化提示
+            }
+            DUST_LOG_OK("[boot] %s init", e->name);   		// 谁在初始化
         }
-        if (!e->func()) {
-            HandleInitFail(*e);
-            continue;                      				// 失败：不打印初始化提示
-        }
-        DUST_LOG_INF("[boot] %s init", e->name);   // 谁在初始化
     }
 
     // 阶段横幅：阶段内条目全部执行完再打印（此时 DUST_LOG 已初始化，PreInit 完成也能出），
@@ -112,11 +109,8 @@ static void RunStage(ThreadStage stage)
         if (static_cast<ThreadStage>(e->stage) != stage) {
             continue;
         }
-        if (!e->func()) {
-            HandleInitFail(*e);
-            continue;                      					// 失败：不打印线程启动提示
-        }
-        DUST_LOG_INF("[boot] %s start", e->name);   	// 谁的线程启动
+        e->func();   										// 线程启动：初始化已过必成功，不检查失败
+        DUST_LOG_OK("[boot] %s start", e->name);   			// 谁的线程启动
     }
 
     // 阶段横幅：线程阶段全部启动完再打印
