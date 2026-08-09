@@ -45,7 +45,6 @@ public:
             k_thread_name_set(&thread_, name);
         }
     }
-
 private:
     k_thread thread_ {};
     K_KERNEL_STACK_MEMBER(stack_, StackSize);
