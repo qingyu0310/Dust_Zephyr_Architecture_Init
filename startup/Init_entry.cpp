@@ -209,10 +209,8 @@ static void RunStage(ThreadStage stage)
         }
 
         const uint64_t begin_cycle = k_cycle_get_64();
-        const bool     ok          = e->start();
-        BootTiming::Record(e->timing,
-                           static_cast<uint32_t>(k_cyc_to_ns_floor64(k_cycle_get_64() - begin_cycle)),
-                           ok);
+        const bool ok  = e->start();
+        BootTiming::Record(e->timing, static_cast<uint32_t>(k_cyc_to_ns_floor64(k_cycle_get_64() - begin_cycle)), ok);
 
         if (!ok)                       							// 线程启动失败：按策略处理
         {
