@@ -14,13 +14,13 @@
 
 `init/` 主要负责：
 
-- 提供 `System_Startup()`，作为 `src/main.c` 调用的系统启动入口；
+- 提供 `System_Startup()`，作为 `startup/main.c` 调用的系统启动入口；
 - 定义 `REGISTER_INIT()` 和 `REGISTER_THREAD()`；
 - 遍历 `.user_init` 和 `.user_thread` 链接段；
 - 按阶段执行初始化函数和线程启动函数；
 - 根据 `InitLevel` 处理初始化失败；
 - 提供 CAN RX 链接段分发入口；
-- 将 `cmd/linker/tflm_init.ld` 接入 Zephyr 链接流程。
+- 将 `cmd/linker/dust_init.ld` 接入 Zephyr 链接流程。
 
 它不负责：
 
@@ -38,22 +38,44 @@
 
 ```text
 init/
+├── startup/                  启动器与注册项
+│   ├── Init_entry.hpp
+│   ├── Init_entry.cpp
+│   ├── System_startup.h
+│   └── main.c
+├── thread/                   线程模板与注册表
+│   ├── thread.hpp
+│   └── thread_registry.hpp
+├── irq/                      中断分发
+│   ├── Irq_handlers.h
+│   └── Irq_handlers.cpp
 ├── CMakeLists.txt
-├── Init_entry.hpp
-├── Init_entry.cpp
-├── System_startup.h
-├── Irq_handlers.h
-└── Irq_handlers.cpp
+├── README.md
+└── ARCHITECTURE.md
 ```
 
 | 文件 | 作用 |
 | --- | --- |
-| `System_startup.h` | 对 C 入口暴露 `System_Startup()` |
-| `Init_entry.hpp` | 定义启动阶段、失败等级、注册项结构和注册宏 |
-| `Init_entry.cpp` | 遍历 `.user_init/.user_thread` 并执行启动阶段 |
-| `Irq_handlers.h` | 定义 `CAN_RX_HANDLER()` 和 CAN RX 分发入口 |
-| `Irq_handlers.cpp` | 根据 CAN ID 遍历 `.can_rx1/2/3` 并调用回调 |
-| `CMakeLists.txt` | 编译启动层源文件并加入链接脚本 |
+| `startup/System_startup.h` | 对 C 入口暴露 `System_Startup()` |
+| `startup/Init_entry.hpp` | 定义启动阶段、失败等级、注册项结构和注册宏 |
+| `startup/Init_entry.cpp` | 遍历 `.user_init/.user_thread` 并执行启动阶段 |
+| `startup/main.c` | 系统入口，调用 `System_Startup()` |
+| `thread/thread.hpp` | 线程模板（创建 / 暂停恢复 / 受管任务外壳 / 运行统计） |
+| `thread/thread_registry.hpp` | 已启动线程登记表，供 shell 的 `thread` 命令遍历 |
+| `irq/Irq_handlers.h` | 定义 `CAN_RX_HANDLER()` 和 CAN RX 分发入口 |
+| `irq/Irq_handlers.cpp` | 根据 CAN ID 遍历 `.can_rx1/2/3` 并调用回调 |
+| `CMakeLists.txt` | 编译启动层源文件、加入三个子目录 include、接入链接脚本 |
+
+**三层职责**：
+
+| 目录 | 管什么 | 不管什么 |
+| --- | --- | --- |
+| `startup/` | 阶段顺序、注册表遍历、失败策略、程序入口 | 线程生命周期、中断分发 |
+| `thread/` | 线程创建、暂停/恢复、受管任务外壳、运行统计 | 业务逻辑、启动顺序 |
+| `irq/` | CAN RX 链接段分发 | CAN 设备初始化、过滤器、IRQ 使能 |
+
+三个子目录的全部 include 由 `init/CMakeLists.txt` 统一加入全局 include，
+业务代码仍只写 `#include "thread.hpp"` / `#include "Init_entry.hpp"`，路径变化对使用者透明。
 
 ---
 
@@ -62,7 +84,7 @@ init/
 根入口位于：
 
 ```text
-src/main.c
+startup/main.c
 ```
 
 当前入口关系是：
@@ -144,10 +166,20 @@ static bool thread_init()
     return true;
 }
 
-REGISTER_INIT(thread_init, MidInit, Mid, "foo_init");
+REGISTER_INIT(thread_init, MidInit, Mid, HaltOnFail, nullptr, "foo_init");
 ```
 
-宏展开后会生成一个静态 `InitEntry`，并放入 `.user_init` 段。启动器运行时通过 `__user_init_start` 和 `__user_init_end` 遍历。
+宏展开后会生成两份对象：一个 `InitEntry` 结构体本体，一个指向它的指针。**指针**放进 `.user_init` 段（`aligned(sizeof(void*))`），启动器通过 `__user_init_start` / `__user_init_end` 遍历指针表，再解引用取结构体。
+
+段里存指针而不是结构体，遍历步长恒为 `sizeof(void*)`，与结构体字段增删无关。
+
+6 个参数的顺序是 **函数 / 阶段 / 等级 / 失败策略 / 清理函数 / 名称**。清理函数在初始化失败时被调用来回滚本项已申请的资源，没有可释放的资源就传 `nullptr`：
+
+```cpp
+static void foo_deinit() { /* 关闭本项打开的设备 */ }
+
+REGISTER_INIT(foo_init, MidInit, Mid, HaltOnFail, foo_deinit, "foo");
+```
 
 ### REGISTER_THREAD
 
@@ -159,10 +191,12 @@ static bool thread_start()
     return true;
 }
 
-REGISTER_THREAD(thread_start, MidThread, Mid, "foo_start");
+REGISTER_THREAD(thread_start, MidThread, "foo_start");
 ```
 
-这样可以把“对象初始化”和“线程启动”分开，避免线程启动时依赖的资源还没有准备好。
+3 个参数：**启动函数 / 线程阶段 / 名称**。没有等级参数——线程启动在对应阶段的所有初始化完成后才执行。
+
+启动函数返回 `false` 时，启动器打印 `[boot] xxx start fail`、置启动中止标志，后续所有阶段（含后续线程）不再执行。可用 `System_StartupAborted()` 查询该状态。这样可以把“对象初始化”和“线程启动”分开，避免线程启动时依赖的资源还没有准备好。
 
 ---
 
@@ -176,7 +210,7 @@ REGISTER_THREAD(thread_start, MidThread, Mid, "foo_start");
 | `Mid` | 打印告警，继续启动 |
 | `Low` | 打印告警，继续启动 |
 
-`InitLevel` 表示失败处理策略，不是同一阶段内的排序优先级。当前同阶段执行顺序由链接段中的条目顺序决定，因此不要把同阶段顺序当作强依赖机制。
+`InitLevel` 在同一阶段内也是**执行顺序**：启动器按 High → Mid → Low 三轮遍历链接段，同等级内才按链接段顺序执行。等级同时也是失败策略：`High` 失败会蜂鸣并停机，`Mid` / `Low` 失败只打印告警继续。
 
 如果组件之间存在硬依赖，优先用不同阶段表达；如果依赖仍然复杂，应在组件的 `thread_init()` 中显式检查依赖对象是否 ready。
 
@@ -197,13 +231,13 @@ REGISTER_THREAD(thread_start, MidThread, Mid, "foo_start");
 这些 section 的实际定义当前集中在：
 
 ```text
-cmd/linker/tflm_init.ld
+cmd/linker/dust_init.ld
 ```
 
 `init/CMakeLists.txt` 通过：
 
 ```cmake
-zephyr_linker_sources(ROM_SECTIONS ../cmd/linker/tflm_init.ld)
+zephyr_linker_sources(ROM_SECTIONS ../cmd/linker/dust_init.ld)
 ```
 
 把链接段定义加入 Zephyr 链接流程。
@@ -252,8 +286,8 @@ static bool thread_start()
     return true;
 }
 
-REGISTER_INIT(thread_init, MidInit, Mid, "foo_init");
-REGISTER_THREAD(thread_start, MidThread, Mid, "foo_start");
+REGISTER_INIT(thread_init, MidInit, Mid, HaltOnFail, nullptr, "foo_init");
+REGISTER_THREAD(thread_start, MidThread, "foo_start");
 
 }  // namespace thread::foo
 ```
@@ -269,11 +303,99 @@ project/boards/<vendor>/<board_cfg>/<board>.overlay
 但不应该修改：
 
 ```text
-src/main.c
-init/Init_entry.cpp
+init/startup/main.c
+init/startup/Init_entry.cpp
 ```
 
 也就是说，`init/` 提供启动框架，具体组件通过本地注册进入框架。
+
+---
+
+## 线程模板 `thread/thread.hpp`
+
+> 从注册宏到 Task 的一层层细节（编译期 / 链接期 / 启动期 / 运行期）见 `doc/线程编写指南.md`。
+
+`Thread<StackSize>` 封装 `k_thread`，有两种用法。
+
+### 裸任务
+
+任务入口是 `void(void*, void*, void*)`，函数自己写循环：
+
+```cpp
+static Thread<2048> thread_ {};
+
+static void Task(void*, void*, void*)
+{
+    for (;;)
+    {
+        k_msleep(10);
+        ...
+    }
+}
+
+thread_.Start(Task, ThreadPrio::High, nullptr, "foo");
+```
+
+适用于**事件驱动**线程（等信号量、等队列）或需要在循环里维护自有状态机的线程。
+
+### 受管任务（推荐用于周期线程）
+
+任务体只写「一拍」，循环、周期等待、统计全部由外壳负责：
+
+```cpp
+static Thread<2048> thread_ {};
+
+static TaskResult Task(void* context)
+{
+    ...
+    return TaskResult::Continue;   // 本拍正常，等下一拍
+}
+
+thread_.Start(Task, K_MSEC(10), ThreadPrio::High, nullptr, "foo");
+```
+
+`TaskResult` 四态：
+
+| 值 | 外壳行为 | 统计 |
+| --- | --- | --- |
+| `Continue` | 等一个周期后重进任务 | — |
+| `Retry` | 调恢复钩子，返回 `true` 则重进任务 | `retry_count++` |
+| `Fatal` | 打 ERR 日志后线程退出 | `fatal_count++` |
+
+`TaskResult` 只有三个值——MCU 上线程常驻，没有「任务主动结束」的场景。
+
+### 恢复钩子
+
+任务返回 `Retry` 时调用，用于「设备掉线后重连」这类场景：
+
+```cpp
+static bool Recover(void* context)
+{
+    if (device_.Reopen()) return true;   // 重进任务
+    return false;                        // 放弃，线程退出
+}
+
+thread_.SetRecoveryHook(Recover);
+thread_.Start(Task, K_MSEC(10), ThreadPrio::High, &device_, "foo");
+```
+
+**契约**：Task 每拍重新进入函数，跨拍状态必须放在函数外的 static 或类成员里。
+
+### 运行统计
+
+受管任务的每次调用都会自动统计：运行次数、Retry/Fatal 次数、单次与累计耗时、栈剩余量。裸任务不参与统计（没有外壳）。
+
+### shell 命令
+
+```text
+thread list             所有已启动线程：名字 / 状态 / run / retry / fatal / exit / drop / 栈剩余
+thread show <name>      单线程详细统计（含 last / max / total 耗时）
+thread pause <name>     暂停线程（内核不再调度，栈与局部变量全部保留）
+thread resume <name>    从暂停处继续执行
+thread reset <name>     清零运行计数器（不影响暂停状态）
+```
+
+`pause` / `resume` 走 `k_thread_suspend` / `k_thread_resume`，是内核级挂起。被暂停的线程如果持有互斥量，等待该互斥量的线程会一直阻塞；当前工程只使用短临界区，所以是安全的。
 
 ---
 
@@ -281,7 +403,7 @@ init/Init_entry.cpp
 
 | 层 | 和 init 的关系 |
 | --- | --- |
-| `src/` | 只调用 `System_Startup()` |
+| `startup/main.c` | 只调用 `System_Startup()` |
 | `project/` | 选择板级配置和业务线程，线程本地注册启动项 |
 | `drivers/` | 提供外设访问能力，不直接决定启动阶段 |
 | `modules/` | 提供设备能力，可被项目线程初始化 |
@@ -332,7 +454,8 @@ System_Startup() 的阶段遍历
 | --- | --- | --- |
 | `InitStage` | 初始化注册项 | 决定一次性初始化在哪个阶段执行 |
 | `ThreadStage` | 线程注册项 | 决定线程创建或启动请求在哪个阶段执行 |
-| `InitLevel` | 注册项 | 决定返回 `false` 后是停止还是继续 |
+| `InitLevel` | 初始化注册项 | 同阶段执行顺序（High → Mid → Low）+ 失败等级 |
+| `InitFailPolicy` | 初始化注册项 | 决定返回 `false` 后是停机还是继续 |
 | RTOS priority | 线程实现或创建参数 | 决定线程被调度时与其他线程的相对优先级 |
 | period / sleep | 线程循环 | 决定线程自身的运行周期 |
 
@@ -346,16 +469,11 @@ System_Startup() 的阶段遍历
 
 | 组件 | 初始化阶段 | 线程阶段 | 等级 | 作用 |
 | --- | --- | --- | --- | --- |
-| GPIO 输出 | `PreInit` | `PreThread` | `Low` | 准备基础输出 |
-| 遥控器 | `PreInit` | `PreThread` | `High` | 初始化接收和协议探测 |
-| CAN TX | `PreInit` | `PreThread` | `High` | 建立统一发送线程 |
-| GPIO 输入 | `EarlyInit` | `EarlyThread` | `Low` | 准备输入资源 |
-| PC 通信 | `PreInit` | `LateThread` | `High` | 接入调试或上位机链路 |
-| IMU | `EarlyInit` | `LateThread` | `High` | 启动采样、校准和姿态输出 |
-| 底盘 | `MidInit` | `MidThread` | `Mid` | 运行底盘控制 |
-| 云台 | `MidInit` | `MidThread` | `Mid` | 运行云台控制 |
-| 测试 | `LateInit` | `LateThread` | `High` | 设备验证和实验功能 |
-| TFLM | `AppInit` | `AppThread` | `Low` | 运行应用层功能 |
+| shell 调试台 | `PreInit` | `PreThread` | `High` | UART 接收 + log/var/thread 命令 |
+| GPIO 心跳 | `PreInit` | `PreThread` | `Low` | PA18 输出翻转 |
+| 遥控器 | `EarlyInit` | `EarlyThread` | `High` | UART 接收 + 协议自动探测 |
+| IMU | `EarlyInit` | `EarlyThread` | `High` | 采样、控温、姿态解算 |
+| 测试 | `LateInit` | `LateThread` | `High` | VOFA+ 波形输出 / 实验功能 |
 
 这张表描述当前项目的实际装配，不是所有项目都必须采用同样的线程集合。
 新增项目组件时，应根据真实依赖选择阶段和等级，而不是机械复制表格。
@@ -369,11 +487,11 @@ System_Startup() 的阶段遍历
       ↓
 REGISTER_INIT / REGISTER_THREAD
       ↓
-InitEntry 常量对象
+InitEntry / ThreadEntry 常量对象
       ↓
-.user_init / .user_thread
+指向它的指针（.user_init / .user_thread）
       ↓
-cmd/linker/tflm_init.ld 的 KEEP
+cmd/linker/dust_init.ld 的 KEEP
       ↓
 __user_*_start / __user_*_end
       ↓
@@ -392,15 +510,16 @@ InitFunc()
 初始化函数应完成一次性资源准备，并返回明确结果：
 
 - `true` 表示当前启动项完成了它承诺的准备工作；
-- `false` 表示无法完成，`InitLevel` 决定是否停止后续启动；
+- `false` 表示无法完成：先调本项的 `cleanup` 回滚资源，再由 `InitFailPolicy` 决定停机还是继续；
 - 不应在初始化函数中放置无限循环；
 - 需要持续执行的功能应拆成线程注册项；
 - 初始化函数中的阻塞等待应有明确上限或可诊断状态。
 
-线程函数应负责自己的循环、周期和退出条件：
+线程函数应负责创建/启动动作，并立即返回：
 
 - 创建或启动动作由统一启动链触发；
-- 线程内部处理设备离线、数据超时和降级；
+- 返回 `false` 会中止后续所有阶段（`System_StartupAborted()` 可查）；
+- 循环、周期、错误处理和统计交给 `Thread<StackSize>` 的外壳（见 `doc/线程编写指南.md`）；
 - 不应通过修改全局启动器来表达业务模式；
 - 线程间通信使用已有 topic、消息队列或模块快照契约。
 
@@ -420,18 +539,18 @@ InitFunc()
 
 ## 链接段与专用消费者
 
-`cmd/linker/tflm_init.ld` 当前保留的注册段包括：
+`cmd/linker/dust_init.ld` 当前保留的注册段包括：
 
 | section | 注册内容 | 消费者 |
 | --- | --- | --- |
 | `.user_init` | 一次性初始化项 | `RunStage()` |
-| `.user_thread` | 线程注册项 | `RunThreadStage()` |
+| `.user_thread` | 线程注册项 | `RunStage(ThreadStage)` |
 | `.can_rx1` | CAN1 ID 回调 | CAN1 RX callback |
 | `.can_rx2` | CAN2 ID 回调 | CAN2 RX callback |
 | `.can_rx3` | CAN3 ID 回调 | CAN3 RX callback |
 | `.remote` | 遥控器协议实现 | `Remote` 模块 |
 | `.imu` | IMU 芯片或实现项 | IMU 模块 |
-| `.shell_var` | shell 变量或控制项 | shell/命令侧代码 |
+| `.shell_var` | 调试变量注册项 | `var` 命令 |
 
 只有 `.user_init` 和 `.user_thread` 由通用阶段遍历直接消费。CAN、remote、
 imu 和 shell section 有各自的消费者，不能把它们都当成启动表。
@@ -473,7 +592,7 @@ handler(data)
 - [ ] 选择合适的 stage、level、线程优先级和周期。
 - [ ] 在本地源文件中使用 `REGISTER_INIT()` / `REGISTER_THREAD()`。
 - [ ] 确认源文件受 Kconfig 和 CMake 控制。
-- [ ] 确认注册 section 被 `tflm_init.ld` 保留。
+- [ ] 确认注册 section 被 `dust_init.ld` 保留。
 - [ ] 如果使用专用 section，确认存在对应消费者。
 - [ ] 明确初始化失败后的系统行为。
 - [ ] 明确设备未 ready、数据超时和线程退出时的行为。

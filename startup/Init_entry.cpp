@@ -1,9 +1,9 @@
 /**
  * @file Init_entry.cpp
  * @author qingyu
- * @brief
- * @version 0.1
- * @date 2026-07-20
+ * @brief 统一启动实现：注册表遍历与失败回滚
+ * @version 0.3
+ * @date 2026-10-19
  *
  * @copyright Copyright (c) 2026
  *
@@ -11,9 +11,21 @@
 
 #include "Init_entry.hpp"
 #include "System_startup.h"
+#include "thread_registry.hpp"
 #include "buzzer.hpp"
 #include "log.hpp"
 #include <zephyr/kernel.h>
+
+static bool startup_aborted = false;   // 启动中止标志（线程启动失败时置位）
+
+/**
+ * @brief 线程登记入口：Thread::Start 创建线程后调用
+ * @param thread 已创建的线程对象
+ */
+void RegisterThreadInstance(ThreadBase* thread)
+{
+    (void)thread_registry::Add(thread);
+}
 
 static void HandleInitFail(const InitEntry& entry)
 {
@@ -75,22 +87,29 @@ static const char* StageName(ThreadStage stage)
 
 static void RunStage(InitStage stage)
 {
-    extern const InitEntry __user_init_start[], __user_init_end[];
+    if (startup_aborted) return;                        // 启动已中止：不再执行后续阶段
+
+    extern const InitEntry* const __user_init_start[];
+    extern const InitEntry* const __user_init_end[];
 
     for (const InitLevel level : kLevelOrder)
     {
-        for (const InitEntry* e = __user_init_start; e < __user_init_end; ++e)
+        for (const InitEntry* const* item = __user_init_start; item < __user_init_end; ++item)
         {
+            const InitEntry* e = *item;
+
             if (e->stage != static_cast<InitStage>(stage)) {
                 continue;
             }
             if (e->level != level) {
                 continue;
             }
-            if (!e->func()) {
+            if (!e->function()) {
+                if (e->cleanup != nullptr) e->cleanup();    	// 部分初始化失败也回滚本项资源
                 HandleInitFail(*e);
-                continue;                      				// 失败：不打印初始化提示
+                continue;                      				 	// 失败：不打印初始化提示
             }
+
             DUST_LOG_OK("[boot] %s init", e->name);   		// 谁在初始化
         }
     }
@@ -102,14 +121,25 @@ static void RunStage(InitStage stage)
 
 static void RunStage(ThreadStage stage)
 {
-    extern const InitEntry __user_thread_start[], __user_thread_end[];
+    if (startup_aborted) return;                        // 启动已中止：不再启动后续线程
 
-    for (const InitEntry* e = __user_thread_start; e < __user_thread_end; ++e)
+    extern const ThreadEntry* const __user_thread_start[];
+    extern const ThreadEntry* const __user_thread_end[];
+
+    for (const ThreadEntry* const* item = __user_thread_start; item < __user_thread_end; ++item)
     {
-        if (static_cast<ThreadStage>(e->stage) != stage) {
+        const ThreadEntry* e = *item;
+
+        if (e->stage != stage) {
             continue;
         }
-        e->func();   										// 线程启动：初始化已过必成功，不检查失败
+
+        if (!e->start()) {                       			// 线程启动失败：记录并中止后续启动
+            DUST_LOG_ERR("[boot] %s start fail", e->name);
+            startup_aborted = true;
+            continue;
+        }
+
         DUST_LOG_OK("[boot] %s start", e->name);   			// 谁的线程启动
     }
 
@@ -156,4 +186,13 @@ void System_Startup(void)
     RunStage(InitStage::AppInit);
     k_msleep(kNormalStageDelayMs);
     RunStage(ThreadStage::AppThread);
+}
+
+/**
+ * @brief 系统启动是否被中止（线程启动失败）
+ * @return true=已中止
+ */
+int System_StartupAborted(void)
+{
+    return startup_aborted ? 1 : 0;
 }

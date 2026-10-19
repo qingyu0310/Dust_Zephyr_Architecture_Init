@@ -1,9 +1,9 @@
 /**
  * @file Init_entry.hpp
  * @author qingyu
- * @brief 初始化项描述：等级、优先级、函数指针
- * @version 0.1
- * @date 2026-07-20
+ * @brief 初始化与线程注册项：阶段、优先级、失败策略和清理回调
+ * @version 0.3
+ * @date 2026-10-19
  *
  * @copyright Copyright (c) 2026
  *
@@ -65,17 +65,33 @@ enum class InitFailPolicy : uint8_t
 using InitFunc = bool (*)();
 
 /**
+ * @brief 资源释放、停止通知或清理回调
+ */
+using CleanupFunc = void (*)();
+
+/**
  * @brief 初始化项描述
  *
  * 每个组件声明一个 InitEntry，链接后形成初始化表，启动器遍历执行。
  */
 struct InitEntry
 {
-    InitFunc          func;      // 初始化函数
+    InitFunc          function;  // 初始化函数
+    CleanupFunc       cleanup;   // 失败回滚与退出清理；可为 nullptr
     InitStage         stage;     // 所属阶段
     InitLevel         level;     // 优先级：高级/中级/低级（仅 Init 用）
     InitFailPolicy    fail;      // 失败策略：停机/继续（仅 Init 用）
     const char*       name;      // 组件名，调试用
+};
+
+/**
+ * @brief 线程注册项
+ */
+struct ThreadEntry
+{
+    InitFunc     start;   // 创建线程后立即返回
+    ThreadStage  stage;   // 所属线程启动阶段
+    const char*  name;    // 日志中的组件标识
 };
 
 /**
@@ -87,28 +103,33 @@ struct InitEntry
  * @param fn       初始化函数（符合 InitFunc 签名）
  * @param stage_   InitStage 枚举值
  * @param level_   InitLevel 枚举值
+ * @param fail_    失败策略
+ * @param cleanup_ 清理函数，须支持部分初始化和未初始化状态
  * @param name_    组件标识，打印用
  */
-#define REGISTER_INIT(fn, stage_, level_, fail_, name_)                        \
-    static const InitEntry kInitEntry_##fn                                     \
-    __attribute__((used, __section__(".user_init"))) = {                       \
-        fn, InitStage::stage_, InitLevel::level_, InitFailPolicy::fail_, name_ \
-}
+#define REGISTER_INIT(fn, stage_, level_, fail_, cleanup_, name_)              \
+    static const InitEntry kInitEntry_##fn = {                                 \
+        fn, cleanup_, InitStage::stage_, InitLevel::level_,                    \
+        InitFailPolicy::fail_, name_                                           \
+    };                                                                         \
+    static const InitEntry* const kInitEntryPtr_##fn                           \
+        __attribute__((used, __section__(".user_init"),                        \
+                       aligned(sizeof(void*)))) = &kInitEntry_##fn
 
 /**
  * @brief 注册线程项
  *
- * 每个线程用此宏声明一个 InitEntry（存放于 .user_thread 段），
+ * 每个线程用此宏声明一个 ThreadEntry（存放于 .user_thread 段），
  * 启动器遍历执行。
  *
- * @param fn       线程函数（符合 InitFunc 签名）
+ * @param fn       线程启动函数（创建线程后立即返回）
  * @param stage_   ThreadStage 枚举值
- * @param level_   InitLevel 枚举值
  * @param name_    组件标识，打印用
  */
 #define REGISTER_THREAD(fn, stage_, name_)                                     \
-    static const InitEntry kThreadEntry_##fn                                   \
-    __attribute__((used, __section__(".user_thread"))) = {                     \
-        fn, static_cast<InitStage>(ThreadStage::stage_), InitLevel::High,      \
-        InitFailPolicy::ContinueOnFail, name_                                  \
-}
+    static const ThreadEntry kThreadEntry_##fn = {                             \
+        fn, ThreadStage::stage_, name_                                         \
+    };                                                                         \
+    static const ThreadEntry* const kThreadEntryPtr_##fn                       \
+        __attribute__((used, __section__(".user_thread"),                      \
+                       aligned(sizeof(void*)))) = &kThreadEntry_##fn

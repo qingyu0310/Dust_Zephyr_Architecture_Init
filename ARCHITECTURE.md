@@ -2,12 +2,12 @@
 
 ## 定位
 
-`init/` 是 tflm 的统一启动层。它把分散在各个 `.cpp` 中的初始化函数、线程启动函数和 CAN 接收处理项，通过链接段收集成表，再按固定阶段执行。
+`init/` 是 本子树架构的统一启动层。它把分散在各个 `.cpp` 中的初始化函数、线程启动函数和 CAN 接收处理项，通过链接段收集成表，再按固定阶段执行。
 
 ## 运行路径
 
 ```text
-src/main.c
+startup/main.c
     -> System_Startup()
         -> RunStage(InitStage)
         -> RunStage(ThreadStage)
@@ -29,12 +29,14 @@ AppInit -> AppThread
 
 ## 注册表
 
-`init/Init_entry.hpp` 定义：
+`init/startup/Init_entry.hpp` 定义：
 
-- `REGISTER_INIT()`：写入 `.user_init`；
-- `REGISTER_THREAD()`：写入 `.user_thread`；
+- `REGISTER_INIT(fn, stage, level, fail, cleanup, name)`：写入 `.user_init`；
+- `REGISTER_THREAD(fn, stage, name)`：写入 `.user_thread`；
 - `InitStage`、`ThreadStage`：表达执行阶段；
-- `InitLevel`：表达失败后的处理等级。
+- `InitLevel`：同阶段内执行顺序（High → Mid → Low）+ 失败处理等级；
+- `InitFailPolicy`：失败后停机（`HaltOnFail`）还是继续（`ContinueOnFail`）；
+- `cleanup`：初始化失败时回滚本项已申请的资源，可为 `nullptr`。
 
 拥有实现的组件在自己的 `.cpp` 中注册，不需要修改中央启动器。
 
@@ -42,17 +44,21 @@ AppInit -> AppThread
 
 `InitFunc` 返回 `bool`。`RunStage()` 发现失败后交给 `HandleInitFail()`：
 
-| 等级 | 当前行为 |
-| --- | --- |
-| `High` | 记录错误并停机 |
-| `Mid` | 记录警告，继续启动 |
-| `Low` | 记录警告，继续启动 |
+| 等级 | 执行顺序 | 失败行为 |
+| --- | --- | --- |
+| `High` | 第一轮 | 记录错误 + 蜂鸣 + 停机 |
+| `Mid` | 第二轮 | 记录警告，继续启动 |
+| `Low` | 第三轮 | 记录警告，继续启动 |
 
-阶段和等级是两个独立维度：阶段决定什么时候运行，等级决定失败后怎么办。
+阶段决定什么时候运行，等级决定同阶段内的先后顺序与失败策略。实际失败行为由 `InitFailPolicy` 决定，`HandleInitFail()` 只区分停机与继续两类。
+
+初始化失败时启动器先调该条目的 `cleanup`（支持部分初始化状态），再走失败策略。
+
+线程启动项没有等级：启动函数返回 `false` 时打印 `[boot] xxx start fail`，置启动中止标志，后续所有阶段（含后续线程）不再执行。`System_StartupAborted()` 可用于查询该状态。
 
 ## 链接段
 
-`init/CMakeLists.txt` 纳入 `Init_entry.cpp`、`Irq_handlers.cpp`，并引入 `cmd/linker/tflm_init.ld`。链接脚本保留：
+`init/CMakeLists.txt` 纳入 `startup/Init_entry.cpp`、`irq/Irq_handlers.cpp`，并引入 `cmd/linker/dust_init.ld`。链接脚本保留：
 
 ```text
 .user_init
@@ -89,11 +95,15 @@ AppInit -> AppThread
 
 | 文件 | 职责 |
 | --- | --- |
-| `Init_entry.hpp` | 阶段、等级、注册项结构和注册宏 |
-| `Init_entry.cpp` | 启动顺序、阶段遍历、失败处理 |
-| `Irq_handlers.h` | CAN RX 注册项和回调声明 |
-| `Irq_handlers.cpp` | CAN RX section 遍历和 ID 分发 |
-| `CMakeLists.txt` | 编译启动实现并引入链接脚本 |
+| `startup/Init_entry.hpp` | 阶段、等级、`InitEntry` / `ThreadEntry` 结构与注册宏 |
+| `startup/Init_entry.cpp` | 启动顺序、阶段遍历、失败处理与回滚 |
+| `startup/System_startup.h` | 对 C 入口暴露 `System_Startup()` / `System_StartupAborted()` |
+| `startup/main.c` | 系统入口 |
+| `thread/thread.hpp` | 线程模板：创建、暂停/恢复、受管任务外壳、运行统计 |
+| `thread/thread_registry.hpp` | 已启动线程登记表 |
+| `irq/Irq_handlers.h` | CAN RX 注册项和回调声明 |
+| `irq/Irq_handlers.cpp` | CAN RX section 遍历和 ID 分发 |
+| `CMakeLists.txt` | 编译启动实现、加入三个子目录 include、引入链接脚本 |
 | `README.md` | 使用说明、边界和维护流程 |
 | `ARCHITECTURE.md` | 运行模型、链接关系和架构约束 |
 
@@ -103,14 +113,14 @@ AppInit -> AppThread
 ## 依赖边界
 
 ```text
-src/main.c
+startup/main.c
       ↓
 init/System_Startup()
       ↓
 project / modules / drivers 的本地注册项
 ```
 
-`src/main.c` 只需要进入 `System_Startup()`。`init/` 可以依赖注册项所需
+`startup/main.c` 只需要进入 `System_Startup()`。`init/` 可以依赖注册项所需
 的公共 RTOS、链接符号和蜂鸣器提示能力，但不应反向包含某个具体项目线程
 或设备协议。
 
@@ -123,7 +133,7 @@ project / modules / drivers 的本地注册项
 | `drivers/` | 设备状态和 IRQ 所需的底层能力 | 不代替驱动检查硬件 |
 | `topic/` | 启动后线程使用的数据契约 | 不参与启动阶段调度 |
 | `cmd/` | 链接脚本和调试入口 | 不把业务组件塞进启动器 |
-| `src/` | 唯一的系统入口调用 | 不保存项目初始化列表 |
+| `startup/main.c` | 唯一的系统入口调用 | 不保存项目初始化列表 |
 
 ## 三个时间点
 
@@ -208,9 +218,19 @@ AppThread
 `InitEntry` 的核心字段是：
 
 ```text
-func   要调用的 InitFunc
-stage  初始化或线程阶段
-level  失败处理等级
+function  要调用的 InitFunc
+cleanup   失败回滚与清理回调（可为 nullptr）
+stage     初始化阶段
+level     同阶段执行顺序 + 失败等级
+fail      失败策略：停机 / 继续
+name      日志和诊断名称
+```
+
+`ThreadEntry` 是独立结构，字段是：
+
+```text
+start  线程启动函数（创建线程后立即返回）
+stage  线程启动阶段
 name   日志和诊断名称
 ```
 
@@ -277,7 +297,6 @@ AppThread
 | 云台 | `MidInit` | `MidThread` | `Mid` |
 | PC 通信 | `PreInit` | `LateThread` | `High` |
 | 测试 | `LateInit` | `LateThread` | `High` |
-| TFLM | `AppInit` | `AppThread` | `Low` |
 
 这张表是当前项目的运行装配，不是 `init/` 对所有应用的硬编码要求。
 
@@ -297,8 +316,8 @@ IMU 已经输出有效姿态；云台线程仍应检查姿态数据是否 ready�
 
 ## 链接脚本和 section
 
-`init/CMakeLists.txt` 编译 `Init_entry.cpp`、`Irq_handlers.cpp`，并引入
-`cmd/linker/tflm_init.ld`。链接脚本保留的主要 section 为：
+`init/CMakeLists.txt` 编译 `startup/Init_entry.cpp`、`irq/Irq_handlers.cpp`，并引入
+`cmd/linker/dust_init.ld`。链接脚本保留的主要 section 为：
 
 ```text
 .user_init
@@ -343,8 +362,8 @@ user_canN_rx_callback()
 handler(data)
 ```
 
-`Irq_handlers.h` 当前定义 CAN 总线编号、`CanRxHandler` 和
-`CanRxEntry`。`Irq_handlers.cpp` 对每个总线 section 做线性匹配，并在
+`irq/Irq_handlers.h` 当前定义 CAN 总线编号、`CanRxHandler` 和
+`CanRxEntry`。`irq/Irq_handlers.cpp` 对每个总线 section 做线性匹配，并在
 找到第一个相同 ID 后调用处理函数。
 
 该路径的职责边界是“把已经收到的帧分发给注册回调”。它不负责：
@@ -368,7 +387,7 @@ handler(data)
 | `drivers/` | 提供设备和 IRQ 初始化 | 不由启动器代替硬件检查 |
 | `topic/` | 供线程启动后交换数据 | 不参与 section 调度 |
 | `cmd/` | 提供链接脚本和调试资源 | 不承载具体业务对象 |
-| `src/` | 调用 `System_Startup()` | 不维护全局组件列表 |
+| `startup/main.c` | 调用 `System_Startup()` | 不维护全局组件列表 |
 
 ## 新增初始化项
 
