@@ -14,13 +14,15 @@
 
 `init/` 主要负责：
 
-- 提供 `System_Startup()`，作为 `startup/main.c` 调用的系统启动入口；
+- 提供 `System_Startup()`，作为 `startup/main.cpp` 调用的系统启动入口；
 - 定义 `REGISTER_INIT()` 和 `REGISTER_THREAD()`；
 - 遍历 `.user_init` 和 `.user_thread` 链接段；
 - 按阶段执行初始化函数和线程启动函数；
-- 根据 `InitLevel` 处理初始化失败；
+- 按 `InitLevel` / `InitFailPolicy` 决定执行顺序与失败处理；
+- 初始化失败时逆序回滚已成功项（`cleanup`），把硬件放回安全态；
+- 记录每项启动耗时，供 `boot timing` 命令查询；
 - 提供 CAN RX 链接段分发入口；
-- 将 `cmd/linker/dust_init.ld` 接入 Zephyr 链接流程。
+- 将 `cmd/linker/dust_init.ld` 与 `cmd/linker/boot_timing.ld` 接入 Zephyr 链接流程。
 
 它不负责：
 
@@ -41,8 +43,10 @@ init/
 ├── startup/                  启动器与注册项
 │   ├── Init_entry.hpp
 │   ├── Init_entry.cpp
+│   ├── boot_timing.hpp
+│   ├── boot_timing.cpp
 │   ├── System_startup.h
-│   └── main.c
+│   └── main.cpp
 ├── thread/                   线程模板与注册表
 │   ├── thread.hpp
 │   └── thread_registry.hpp
@@ -59,12 +63,14 @@ init/
 | `startup/System_startup.h` | 对 C 入口暴露 `System_Startup()` |
 | `startup/Init_entry.hpp` | 定义启动阶段、失败等级、注册项结构和注册宏 |
 | `startup/Init_entry.cpp` | 遍历 `.user_init/.user_thread` 并执行启动阶段 |
-| `startup/main.c` | 系统入口，调用 `System_Startup()` |
+| `startup/boot_timing.hpp` | `BootTimingSlot` 结构与耗时槽写入/遍历接口 |
+| `startup/boot_timing.cpp` | `.boot_timing` 段边界遍历实现 |
+| `startup/main.cpp` | 系统入口：启动 + 中止检查 + 空转 |
 | `thread/thread.hpp` | 线程模板（创建 / 暂停恢复 / 受管任务外壳 / 运行统计） |
 | `thread/thread_registry.hpp` | 已启动线程登记表，供 shell 的 `thread` 命令遍历 |
 | `irq/Irq_handlers.h` | 定义 `CAN_RX_HANDLER()` 和 CAN RX 分发入口 |
 | `irq/Irq_handlers.cpp` | 根据 CAN ID 遍历 `.can_rx1/2/3` 并调用回调 |
-| `CMakeLists.txt` | 编译启动层源文件、加入三个子目录 include、接入链接脚本 |
+| `CMakeLists.txt` | 编译启动层源文件、加入三个子目录 include、接入两个链接脚本 |
 
 **三层职责**：
 
@@ -84,7 +90,7 @@ init/
 根入口位于：
 
 ```text
-startup/main.c
+startup/main.cpp
 ```
 
 当前入口关系是：
@@ -191,12 +197,17 @@ static bool thread_start()
     return true;
 }
 
-REGISTER_THREAD(thread_start, MidThread, "foo_start");
+REGISTER_THREAD(thread_start, MidThread, ContinueOnFail, "foo_start");
 ```
 
-3 个参数：**启动函数 / 线程阶段 / 名称**。没有等级参数——线程启动在对应阶段的所有初始化完成后才执行。
+启动函数返回 `false` 时按 `fail` 参数处理：
 
-启动函数返回 `false` 时，启动器打印 `[boot] xxx start fail`、置启动中止标志，后续所有阶段（含后续线程）不再执行。可用 `System_StartupAborted()` 查询该状态。这样可以把“对象初始化”和“线程启动”分开，避免线程启动时依赖的资源还没有准备好。
+- `HaltOnFail` → `[boot] xxx start fail, halting`，置 `startup_aborted`，后续所有阶段不再执行
+- `ContinueOnFail` → `[boot] xxx start fail, continue`，继续启动其它线程
+
+4 个参数：**启动函数 / 线程阶段 / 失败策略 / 名称**。线程项没有等级——线程启动在对应阶段的所有初始化完成后才执行。
+
+这样可以把「对象初始化」和「线程启动」分开，避免线程启动时依赖的资源还没有准备好。
 
 ---
 
@@ -216,6 +227,69 @@ REGISTER_THREAD(thread_start, MidThread, "foo_start");
 
 ---
 
+## 启动期耗时记录
+
+`REGISTER_INIT()` / `REGISTER_THREAD()` 每展开一次，除了生成注册项，
+还在 `.boot_timing` 段生成一个 `BootTimingSlot`：
+
+```cpp
+struct BootTimingSlot
+{
+    const char* name;   // 项目名
+    uint32_t    ns;     // 耗时（启动器写入）
+    bool        ok;     // 是否成功（启动器写入）
+};
+```
+
+启动器在调用每项的 `function()` / `start()` 前后读 `k_cycle_get_64()`，
+把差值写入槽。槽的数量由链接器按实际注册项决定，**不需要固定容量**。
+
+查询：
+
+```text
+boot timing
+```
+
+输出按耗时降序，失败项标 `FAIL`：
+
+```text
+BOOT TIMING (total 42 ms, 8 items)
+  imu_init          25.134 ms   ok
+  w25q128            8.021 ms   ok
+  dbg_init           3.552 ms   ok
+  ...
+```
+
+## 启动中止与停机
+
+两种失败路径：
+
+| 路径 | 触发 | 行为 |
+| --- | --- | --- |
+| 初始化项失败 | `REGISTER_INIT` 的 `function()` 返回 false | 先 `cleanup` 回滚本项，再按 `InitFailPolicy`：`HaltOnFail` 逆序回滚全部已成功项 + 长鸣 + 停机；`ContinueOnFail` 仅告警 |
+| 线程启动失败 | `REGISTER_THREAD` 的 `start()` 返回 false | `HaltOnFail` 置 `startup_aborted`，后续所有阶段跳过；`ContinueOnFail` 告警后继续 |
+
+`System_Startup()` **保证返回**。线程启动失败只记录状态，由 `main.cpp` 查询
+`System_StartupAborted()` 后决定是否蜂鸣停机：
+
+```cpp
+int main(void)
+{
+    System_Startup();
+
+    if (System_StartupAborted()) {
+        DUST_LOG_ERR("[boot] startup aborted, halting");
+        EXEC_BUZZER_LONG();
+        for (;;) { k_msleep(1000); }
+    }
+
+    for (;;) { k_msleep(1000); }
+}
+```
+
+**为什么停机用 `k_msleep(1000)` 而不是空转**：shell 线程优先级最低，
+主线程空转会把日志全部堵在队列里；休眠停机能让 shell 把失败现场发完。
+
 ## 链接段关系
 
 `init/` 运行时会消费这些链接段边界：
@@ -224,23 +298,30 @@ REGISTER_THREAD(thread_start, MidThread, "foo_start");
 | --- | --- | --- |
 | `.user_init` | `REGISTER_INIT()` | `__user_init_start/end` |
 | `.user_thread` | `REGISTER_THREAD()` | `__user_thread_start/end` |
+| `.boot_timing` | `REGISTER_INIT()` / `REGISTER_THREAD()` | `__boot_timing_start/end` |
 | `.can_rx1` | `CAN_RX_HANDLER(USER_RX_CAN1, ...)` | `__can_rx1_start/end` |
 | `.can_rx2` | `CAN_RX_HANDLER(USER_RX_CAN2, ...)` | `__can_rx2_start/end` |
 | `.can_rx3` | `CAN_RX_HANDLER(USER_RX_CAN3, ...)` | `__can_rx3_start/end` |
 
-这些 section 的实际定义当前集中在：
+这些 section 的定义集中在两个链接脚本：
 
-```text
-cmd/linker/dust_init.ld
-```
+| 脚本 | 注册方式 | 段属性 |
+| --- | --- | --- |
+| `cmd/linker/dust_init.ld` | `ROM_SECTIONS` | 只读（注册表本身） |
+| `cmd/linker/boot_timing.ld` | `DATA_SECTIONS` | **可写**（槽在运行期写入耗时） |
 
 `init/CMakeLists.txt` 通过：
 
 ```cmake
-zephyr_linker_sources(ROM_SECTIONS ../cmd/linker/dust_init.ld)
+zephyr_linker_sources(ROM_SECTIONS  ../cmd/linker/dust_init.ld)
+zephyr_linker_sources(DATA_SECTIONS ../cmd/linker/boot_timing.ld)
 ```
 
-把链接段定义加入 Zephyr 链接流程。
+把两个脚本加入 Zephyr 链接流程。
+
+**为什么分开**：`.boot_timing` 段内的槽需要在启动时写入 `ns` / `ok`，
+必须是 RAM 段（初值从 ROM 拷贝，与 `.data` 同机制）；而 `.user_init` /
+`.user_thread` 只是指针表，只读即可。
 
 ---
 
@@ -287,7 +368,7 @@ static bool thread_start()
 }
 
 REGISTER_INIT(thread_init, MidInit, Mid, HaltOnFail, nullptr, "foo_init");
-REGISTER_THREAD(thread_start, MidThread, "foo_start");
+REGISTER_THREAD(thread_start, MidThread, ContinueOnFail, "foo_start");
 
 }  // namespace thread::foo
 ```
@@ -303,7 +384,7 @@ project/boards/<vendor>/<board_cfg>/<board>.overlay
 但不应该修改：
 
 ```text
-init/startup/main.c
+init/startup/main.cpp
 init/startup/Init_entry.cpp
 ```
 
@@ -403,7 +484,7 @@ thread reset <name>     清零运行计数器（不影响暂停状态）
 
 | 层 | 和 init 的关系 |
 | --- | --- |
-| `startup/main.c` | 只调用 `System_Startup()` |
+| `startup/main.cpp` | 只调用 `System_Startup()` |
 | `project/` | 选择板级配置和业务线程，线程本地注册启动项 |
 | `drivers/` | 提供外设访问能力，不直接决定启动阶段 |
 | `modules/` | 提供设备能力，可被项目线程初始化 |
@@ -545,6 +626,7 @@ InitFunc()
 | --- | --- | --- |
 | `.user_init` | 一次性初始化项 | `RunStage()` |
 | `.user_thread` | 线程注册项 | `RunStage(ThreadStage)` |
+| `.boot_timing` | 启动耗时槽 | `BootTiming` / `boot timing` 命令 |
 | `.can_rx1` | CAN1 ID 回调 | CAN1 RX callback |
 | `.can_rx2` | CAN2 ID 回调 | CAN2 RX callback |
 | `.can_rx3` | CAN3 ID 回调 | CAN3 RX callback |
@@ -552,8 +634,9 @@ InitFunc()
 | `.imu` | IMU 芯片或实现项 | IMU 模块 |
 | `.shell_var` | 调试变量注册项 | `var` 命令 |
 
-只有 `.user_init` 和 `.user_thread` 由通用阶段遍历直接消费。CAN、remote、
-imu 和 shell section 有各自的消费者，不能把它们都当成启动表。
+只有 `.user_init` 和 `.user_thread` 由通用阶段遍历直接消费。`.boot_timing`
+由启动器写入、由 `boot` 命令读取。CAN、remote、imu 和 shell section 有各自的
+消费者，不能把它们都当成启动表。
 
 ## CAN RX 分发检查
 

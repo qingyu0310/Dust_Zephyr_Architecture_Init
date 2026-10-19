@@ -7,7 +7,7 @@
 ## 运行路径
 
 ```text
-startup/main.c
+startup/main.cpp
     -> System_Startup()
         -> RunStage(InitStage)
         -> RunStage(ThreadStage)
@@ -52,13 +52,30 @@ AppInit -> AppThread
 
 阶段决定什么时候运行，等级决定同阶段内的先后顺序与失败策略。实际失败行为由 `InitFailPolicy` 决定，`HandleInitFail()` 只区分停机与继续两类。
 
-初始化失败时启动器先调该条目的 `cleanup`（支持部分初始化状态），再走失败策略。
+初始化失败时启动器**先调该条目的 `cleanup`**（支持部分初始化状态），再走失败策略；`HaltOnFail` 停机前还会**逆序回滚所有已成功项**，把硬件放回安全态（PWM 停输出、Flash 掉电等），最后长鸣并进入休眠停机循环。
 
-线程启动项没有等级：启动函数返回 `false` 时打印 `[boot] xxx start fail`，置启动中止标志，后续所有阶段（含后续线程）不再执行。`System_StartupAborted()` 可用于查询该状态。
+线程启动项没有等级，但带 `InitFailPolicy`：启动函数返回 `false` 时，`HaltOnFail` 打印 `[boot] xxx start fail, halting` 并置 `startup_aborted`，后续所有阶段不再执行；`ContinueOnFail` 打印 `[boot] xxx start fail, continue` 后继续启动其它线程。
+
+`System_Startup()` 保证返回，停机策略由 `main.cpp` 查询 `System_StartupAborted()` 后决定。
+
+## 启动期耗时
+
+`REGISTER_INIT()` / `REGISTER_THREAD()` 每次展开都会额外生成一个 `BootTimingSlot`，放进 `.boot_timing` 段。启动器在执行每项前后读 `k_cycle_get_64()`，把耗时与结果写入槽。
+
+- 段定义在 `cmd/linker/boot_timing.ld`，用 `DATA_SECTIONS`（需可写）
+- 槽数量由链接器按实际注册项决定，无固定数组
+- 查询入口：`boot timing` 命令（按耗时降序，失败项标 `FAIL`）
 
 ## 链接段
 
-`init/CMakeLists.txt` 纳入 `startup/Init_entry.cpp`、`irq/Irq_handlers.cpp`，并引入 `cmd/linker/dust_init.ld`。链接脚本保留：
+`init/CMakeLists.txt` 纳入 `startup/Init_entry.cpp`、`startup/boot_timing.cpp`、`startup/main.cpp`、`irq/Irq_handlers.cpp`，并引入两个链接脚本：
+
+```cmake
+zephyr_linker_sources(ROM_SECTIONS  ../cmd/linker/dust_init.ld)     # 只读注册表
+zephyr_linker_sources(DATA_SECTIONS ../cmd/linker/boot_timing.ld)   # 可写耗时槽
+```
+
+`dust_init.ld` 保留：
 
 ```text
 .user_init
@@ -98,7 +115,9 @@ AppInit -> AppThread
 | `startup/Init_entry.hpp` | 阶段、等级、`InitEntry` / `ThreadEntry` 结构与注册宏 |
 | `startup/Init_entry.cpp` | 启动顺序、阶段遍历、失败处理与回滚 |
 | `startup/System_startup.h` | 对 C 入口暴露 `System_Startup()` / `System_StartupAborted()` |
-| `startup/main.c` | 系统入口 |
+| `startup/boot_timing.hpp` | `BootTimingSlot` 结构与耗时槽写入/遍历接口 |
+| `startup/boot_timing.cpp` | `.boot_timing` 段边界遍历实现 |
+| `startup/main.cpp` | 系统入口：启动 + 中止检查 + 空转 |
 | `thread/thread.hpp` | 线程模板：创建、暂停/恢复、受管任务外壳、运行统计 |
 | `thread/thread_registry.hpp` | 已启动线程登记表 |
 | `irq/Irq_handlers.h` | CAN RX 注册项和回调声明 |
@@ -113,14 +132,14 @@ AppInit -> AppThread
 ## 依赖边界
 
 ```text
-startup/main.c
+startup/main.cpp
       ↓
 init/System_Startup()
       ↓
 project / modules / drivers 的本地注册项
 ```
 
-`startup/main.c` 只需要进入 `System_Startup()`。`init/` 可以依赖注册项所需
+`startup/main.cpp` 只需要进入 `System_Startup()`。`init/` 可以依赖注册项所需
 的公共 RTOS、链接符号和蜂鸣器提示能力，但不应反向包含某个具体项目线程
 或设备协议。
 
@@ -133,7 +152,7 @@ project / modules / drivers 的本地注册项
 | `drivers/` | 设备状态和 IRQ 所需的底层能力 | 不代替驱动检查硬件 |
 | `topic/` | 启动后线程使用的数据契约 | 不参与启动阶段调度 |
 | `cmd/` | 链接脚本和调试入口 | 不把业务组件塞进启动器 |
-| `startup/main.c` | 唯一的系统入口调用 | 不保存项目初始化列表 |
+| `startup/main.cpp` | 唯一的系统入口调用 | 不保存项目初始化列表 |
 
 ## 三个时间点
 
@@ -339,6 +358,7 @@ IMU 已经输出有效姿态；云台线程仍应检查姿态数据是否 ready�
 | `.remote` | `Remote` 模块 | 收集遥控器协议实现 |
 | `.imu` | IMU 模块 | 收集芯片或 IMU 实现 |
 | `.shell_var` | shell 侧代码 | 收集调试变量或命令项 |
+| `.boot_timing` | `BootTiming` / `boot` 命令 | 启动耗时槽，启动器写入 |
 
 修改 section 名、段边界或 `KEEP()` 时，必须同时检查注册宏、CMake、导出
 符号和消费者代码。只改其中一处会造成“编译通过但启动表为空”或“回调
@@ -387,7 +407,7 @@ handler(data)
 | `drivers/` | 提供设备和 IRQ 初始化 | 不由启动器代替硬件检查 |
 | `topic/` | 供线程启动后交换数据 | 不参与 section 调度 |
 | `cmd/` | 提供链接脚本和调试资源 | 不承载具体业务对象 |
-| `startup/main.c` | 调用 `System_Startup()` | 不维护全局组件列表 |
+| `startup/main.cpp` | 调用 `System_Startup()` | 不维护全局组件列表 |
 
 ## 新增初始化项
 

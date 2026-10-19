@@ -2,7 +2,8 @@
 
 target_sources(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/startup/Init_entry.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/startup/main.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/startup/boot_timing.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/startup/main.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/irq/Irq_handlers.cpp
 )
 
@@ -14,3 +15,4 @@ target_include_directories(app PRIVATE
 )
 
 zephyr_linker_sources(ROM_SECTIONS ../cmd/linker/dust_init.ld)
+zephyr_linker_sources(DATA_SECTIONS ../cmd/linker/boot_timing.ld)
