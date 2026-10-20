@@ -2,8 +2,8 @@
  * @file thread.hpp
  * @author qingyu
  * @brief Zephyr 线程模板，封装线程创建、暂停/恢复、受管任务外壳与运行统计
- * @version 0.6
- * @date 2026-10-19
+ * @version 0.7
+ * @date 2026-10-20
  *
  * @copyright Copyright (c) 2026
  *
@@ -70,8 +70,20 @@ public:
     virtual ~ThreadBase() = default;
 
     virtual const char* Name() const = 0;
+    virtual k_tid_t     Tid() const = 0;
     virtual bool        GetStats(ThreadStats& out) const = 0;
     virtual void        ResetStats() = 0;
+
+    /**
+     * @brief 设置「保留标记」：致命错误冻结线程时不暂停本线程
+     * @param on true=保留（如 shell 调试通道）
+     */
+    virtual void SetKeepAlive(bool on) = 0;
+
+    /**
+     * @brief 是否带保留标记
+     */
+    virtual bool KeepAlive() const = 0;
 
     /**
      * @brief 暂停线程：内核不再调度，保留全部现场
@@ -111,9 +123,8 @@ public:
         atomic_clear(&paused_);
 
         name_ = name;
-
-        k_thread_create(&thread_, stack_, K_THREAD_STACK_SIZEOF(stack_),
-                        entry, p1, nullptr, nullptr, static_cast<uint8_t>(prio), 0, K_NO_WAIT);
+        k_thread_create(&thread_, stack_, K_THREAD_STACK_SIZEOF(stack_), entry, p1, nullptr, nullptr, static_cast<uint8_t>(prio), 0, K_NO_WAIT);
+		
         atomic_set(&started_, 1);
 
         if (name != nullptr) {
@@ -171,14 +182,38 @@ public:
         atomic_clear(&paused_);
     }
 
-    bool Paused() const override { return atomic_get(&paused_) != 0; }
+    bool Paused() const override 
+	{ 
+		return atomic_get(&paused_) != 0; 
+	}
 
-    const char* Name() const override { return (name_ != nullptr) ? name_ : "?"; }
+    const char* Name() const override 
+	{ 
+		return (name_ != nullptr) ? name_ : "?"; 
+	}
+
+    k_tid_t Tid() const override 
+	{ 
+		return const_cast<k_thread*>(&thread_); 
+	}
+
+    void SetKeepAlive(bool on) override 
+	{ 
+		atomic_set(&keep_alive_, on ? 1 : 0); 
+	}
+
+    bool KeepAlive() const override
+	{ 
+		return atomic_get(&keep_alive_) != 0;
+	}
 
     /**
      * @brief 业务侧计数一次丢帧/丢包
      */
-    void CountDrop() { atomic_inc(&drop_count_); }
+    void CountDrop() 
+	{ 
+		atomic_inc(&drop_count_); 
+	}
 
     /**
      * @brief 清零运行统计（不清线程生命周期与暂停状态）
@@ -223,6 +258,7 @@ private:
 
     atomic_t     paused_          = ATOMIC_INIT(0);   // 暂停标志
     atomic_t     started_         = ATOMIC_INIT(0);   // 是否已创建
+    atomic_t     keep_alive_      = ATOMIC_INIT(0);   // fatal 冻结时保留（默认冻结）
 
     TaskFunc     task_    		  = nullptr;   		  // 受管任务入口（裸任务为空）
     k_timeout_t  period_          = K_NO_WAIT;        // 两拍间隔
