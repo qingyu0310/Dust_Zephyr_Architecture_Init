@@ -35,8 +35,11 @@ public:
     {
         if (thread == nullptr) return false;
 
-        for (uint8_t i = 0; i < count_; ++i) {
-            if (threads_[i] == thread) return true;         // 同一对象重复登记：视为成功
+        for (uint8_t i = 0; i < count_; ++i) 
+		{
+            if (threads_[i] == thread) {
+				return true;         		// 同一对象重复登记：视为成功
+			}
         }
 
         if (count_ >= kMaxThreads) return false;
@@ -71,7 +74,9 @@ public:
 
         for (uint8_t i = 0; i < count_; ++i)
         {
-            if (std::strcmp(threads_[i]->Name(), name) == 0) return threads_[i];
+            if (std::strcmp(threads_[i]->Name(), name) == 0) {
+				return threads_[i];
+			}
         }
         return nullptr;
     }
