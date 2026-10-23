@@ -2,8 +2,8 @@
  * @file thread.hpp
  * @author qingyu
  * @brief Zephyr 线程模板，封装线程创建、暂停/恢复、受管任务外壳、运行统计与终止
- * @version 0.9
- * @date 2026-10-23
+ * @version 0.10
+ * @date 2026-10-24
  *
  * @copyright Copyright (c) 2026
  *
@@ -37,8 +37,9 @@ enum class ThreadPrio : uint8_t
  */
 enum class TaskResult : uint8_t
 {
-    Continue = 0,   				// 本拍正常结束：外壳等下一拍再调一次
-    Retry    = 1,   				// 可恢复错误：先交给 RetryHook，处理不了再交给 DefaultHandle
+    Continue = 0,   				// 本拍成功：外壳等下一拍再调一次
+    Retry    = 1,   				// 需要重试：先交给 RetryHook，处理不了再交给 DefaultHandle
+    Exit     = 2,   				// 需要退出：跳过 RetryHook，直接交给 DefaultHandle 按策略处置
 };
 
 using TaskFunc = TaskResult (*)(void* context);
@@ -392,6 +393,10 @@ private:
                     // 二级：钩子处理不了 → 默认处置函数直接决定生死（不返回）
                     DefaultHandle(this);
                 }
+            }
+            else if (result == TaskResult::Exit)
+            {
+                DefaultHandle(this);        // 业务要求退出：跳过 RetryHook，直接按策略处置（不返回）
             }
 
             if (!K_TIMEOUT_EQ(task_.period, K_NO_WAIT))

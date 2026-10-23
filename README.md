@@ -418,20 +418,21 @@ thread_.Start(Task, K_MSEC(10), ThreadPrio::High, nullptr, "foo");
 
 `Start` 的参数顺序：**任务函数 / 周期 / 优先级 / 上下文 / 线程名**。周期传 `K_NO_WAIT` 表示不等，节拍由 Task 内部的阻塞点（如 `k_sem_take`）决定。
 
-`TaskResult` 两态：
+`TaskResult` 三态：
 
 | 值 | 外壳行为 | 统计 |
 | --- | --- | --- |
-| `Continue` | 等一个周期后重进任务 | — |
-| `Retry` | 先调 Retry 钩子；钩子返回 `true` 则重进任务，`false` 则交给故障处置 | `retry_count++` |
+| `Continue` | 本拍成功，等一个周期后重进任务 | — |
+| `Retry` | 先调 Retry 钩子；钩子返回 `true` 则重进任务，`false` 则交给 `DefaultHandle` | `retry_count++` |
+| `Exit` | 跳过 Retry 钩子，直接交给 `DefaultHandle` 按策略处置 | — |
 
-`TaskResult` 只有两个值——MCU 上线程常驻，没有「任务主动结束」的场景，正常结束与可恢复错误本来就该由业务自己按拍处理。
+三态的分界是「业务自己的判断」：`Continue` = 这拍干完了，`Retry` = 这拍失败但值得再试，`Exit` = 不要再试，按线程影响面收场。`Retry` 与 `Exit` 的处置都由 `DefaultHandle` 按策略决定，差别只在于要不要先给 Retry 钩子一次自救机会。
 
 **契约**：Task 每拍重新进入函数，跨拍状态必须放在函数外的 static 或类成员里。
 
 ### 故障处置：策略与两个钩子
 
-线程出故障（`Task` 返回 `Retry` 且自己处理不了）时，由故障处置链路决定生死。每个线程在 `Start` 前用 `SetFaultPolicy()` 声明自己的影响面：
+线程报 `Retry` 且自己处理不了，或直接报 `Exit` 时，由故障处置链路决定生死。每个线程在 `Start` 前用 `SetFaultPolicy()` 声明自己的影响面：
 
 | 策略 | 影响面 | 处置 | 系统后续 |
 | --- | --- | --- | --- |
@@ -441,20 +442,20 @@ thread_.Start(Task, K_MSEC(10), ThreadPrio::High, nullptr, "foo");
 处置链是两级：
 
 ```text
-Task 返回 Retry
-      ↓
-RetryHook(context)          ← 一级：线程自己就地处理，回答「扛住了吗」
-      ↓ false / 没装钩子
-DefaultHandle(thread)       ← 二级：按 FaultPolicy 兜底
-      ↓
-Isolate -> thread->Exit()   Recover -> Halt() 全杀
+Task 返回 Retry                     Task 返回 Exit
+      ↓                                   ↓
+RetryHook(context)                  （跳过钩子）
+      ↓ false / 没装钩子                  ↓
+      └──────────→ DefaultHandle(thread) ←┘
+                          ↓
+        Isolate -> thread->Exit()    Recover -> Halt() 全杀
 ```
 
 `DefaultHandle` 是**弱符号**，项目可以在自己的编译单元里重定义同名函数整体替换默认策略。
 
 ### Retry 钩子
 
-任务返回 `Retry` 时优先调用，用于「设备掉线后可重连」这类场景：
+任务返回 `Retry` 时优先调用（返回 `Exit` 时不经过它），用于「设备掉线后可重连」这类场景：
 
 ```cpp
 static bool OnRetry(void* context)
