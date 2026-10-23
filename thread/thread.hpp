@@ -2,8 +2,8 @@
  * @file thread.hpp
  * @author qingyu
  * @brief Zephyr 线程模板，封装线程创建、暂停/恢复、受管任务外壳与运行统计
- * @version 0.7
- * @date 2026-10-20
+ * @version 0.8
+ * @date 2026-10-22
  *
  * @copyright Copyright (c) 2026
  *
@@ -14,7 +14,6 @@
 #include <zephyr/kernel.h>
 #include <cstdint>
 #include <cstring>
-#include "log.hpp"
 
 /**
  * @brief 线程优先级（Zephyr 数值越小优先级越高）
@@ -35,9 +34,8 @@ enum class ThreadPrio : uint8_t
  */
 enum class TaskResult : uint8_t
 {
-    Continue = 0,   // 本拍正常结束：外壳等下一拍再调一次
-    Retry    = 1,   // 可恢复错误：交给恢复钩子
-    Fatal    = 2,   // 不可恢复错误：记录后退出
+    Continue = 0,   				// 本拍正常结束：外壳等下一拍再调一次
+    Retry    = 1,   				// 可恢复错误：交给恢复钩子
 };
 
 using TaskFunc     = TaskResult (*)(void* context);
@@ -51,7 +49,6 @@ struct ThreadStats
     const char* name;               // 线程名
     uint32_t    run_count;          // 任务体进入次数
     uint32_t    retry_count;        // 可恢复错误次数
-    uint32_t    fatal_count;        // 不可恢复错误次数
     uint32_t    drop_count;         // 业务丢帧/丢包计数
     uint64_t    run_ns;             // 任务体累计执行时间
     uint64_t    max_run_ns;         // 单次最长执行时间
@@ -118,26 +115,10 @@ class Thread final : public ThreadBase
 public:
     Thread() = default;
 
-    void Start(k_thread_entry_t entry, ThreadPrio prio = ThreadPrio::Normal, void* p1 = nullptr, const char* name = nullptr)
-    {
-        atomic_clear(&paused_);
-
-        name_ = name;
-        k_thread_create(&thread_, stack_, K_THREAD_STACK_SIZEOF(stack_), entry, p1, nullptr, nullptr, static_cast<uint8_t>(prio), 0, K_NO_WAIT);
-		
-        atomic_set(&started_, 1);
-
-        if (name != nullptr) {
-            k_thread_name_set(&thread_, name);
-        }
-
-        RegisterThreadInstance(this);   // 登记到注册表，供 shell 的 thread 命令遍历
-    }
-
     /**
-     * @brief 启动周期任务：外壳负责循环、周期等待与统计
+     * @brief 启动受管任务：外壳负责循环、周期等待、统计与结果处理
      * @param entry   任务入口（每拍调用一次）
-     * @param period  两拍之间的等待时长
+     * @param period  两拍之间的等待时长（K_NO_WAIT=不等待，节拍由任务体自己决定）
      * @param prio    线程优先级
      * @param context 任务上下文（每拍原样传回）
      * @param name    线程名
@@ -148,7 +129,18 @@ public:
         period_  = period;
         context_ = context;
 
-        Start(RunEntry, prio, this, name);   // 复用裸任务路径
+        atomic_clear(&paused_);
+
+        name_ = name;
+        k_thread_create(&thread_, stack_, K_THREAD_STACK_SIZEOF(stack_), RunEntry, this, nullptr, nullptr, static_cast<uint8_t>(prio), 0, K_NO_WAIT);
+
+        atomic_set(&started_, 1);
+
+        if (name != nullptr) {
+            k_thread_name_set(&thread_, name);
+        }
+
+        RegisterThreadInstance(this);   // 登记到注册表，供 shell 的 thread 命令遍历
     }
 
     /**
@@ -182,28 +174,44 @@ public:
         atomic_clear(&paused_);
     }
 
-    bool Paused() const override 
-	{ 
-		return atomic_get(&paused_) != 0; 
+    /**
+     * @brief 是否处于暂停状态
+     */
+    bool Paused() const override
+	{
+		return atomic_get(&paused_) != 0;
 	}
 
-    const char* Name() const override 
-	{ 
-		return (name_ != nullptr) ? name_ : "?"; 
+    /**
+     * @brief 线程名
+     */
+    const char* Name() const override
+	{
+		return (name_ != nullptr) ? name_ : "?";
 	}
 
-    k_tid_t Tid() const override 
-	{ 
-		return const_cast<k_thread*>(&thread_); 
+    /**
+     * @brief 线程 ID（内核线程对象指针）
+     */
+    k_tid_t Tid() const override
+	{
+		return const_cast<k_thread*>(&thread_);
 	}
 
-    void SetKeepAlive(bool on) override 
-	{ 
-		atomic_set(&keep_alive_, on ? 1 : 0); 
+    /**
+     * @brief 设置「保留标记」：致命错误冻结线程时不暂停本线程
+     * @param on true=保留
+     */
+    void SetKeepAlive(bool on) override
+	{
+		atomic_set(&keep_alive_, on ? 1 : 0);
 	}
 
+    /**
+     * @brief 是否带保留标记
+     */
     bool KeepAlive() const override
-	{ 
+	{
 		return atomic_get(&keep_alive_) != 0;
 	}
 
@@ -222,7 +230,6 @@ public:
     {
         atomic_clear(&run_count_);
         atomic_clear(&retry_count_);
-        atomic_clear(&fatal_count_);
         atomic_clear(&drop_count_);
 
         run_cycles_      = 0;
@@ -237,16 +244,15 @@ public:
      */
     bool GetStats(ThreadStats& out) const override
     {
-        out.name        = Name();
-        out.run_count   = static_cast<uint32_t>(atomic_get(&run_count_));
-        out.retry_count = static_cast<uint32_t>(atomic_get(&retry_count_));
-        out.fatal_count = static_cast<uint32_t>(atomic_get(&fatal_count_));
-        out.drop_count  = static_cast<uint32_t>(atomic_get(&drop_count_));
-        out.run_ns      = k_cyc_to_ns_floor64(run_cycles_);
-        out.max_run_ns  = k_cyc_to_ns_floor64(max_run_cycles_);
-        out.last_run_ns = k_cyc_to_ns_floor64(last_run_cycles_);
-        out.running     = IsAlive();
-        out.paused      = Paused();
+        out.name         = Name();
+        out.run_count    = static_cast<uint32_t>(atomic_get(&run_count_));
+        out.retry_count  = static_cast<uint32_t>(atomic_get(&retry_count_));
+        out.drop_count   = static_cast<uint32_t>(atomic_get(&drop_count_));
+        out.run_ns       = k_cyc_to_ns_floor64(run_cycles_);
+        out.max_run_ns   = k_cyc_to_ns_floor64(max_run_cycles_);
+        out.last_run_ns  = k_cyc_to_ns_floor64(last_run_cycles_);
+        out.running      = IsAlive();
+        out.paused       = Paused();
         out.stack_unused = StackUnused();
 
         return atomic_get(&started_) != 0;
@@ -268,7 +274,6 @@ private:
 
     atomic_t     run_count_       = ATOMIC_INIT(0);   // 任务体进入次数
     atomic_t     retry_count_     = ATOMIC_INIT(0);   // 可恢复错误次数
-    atomic_t     fatal_count_     = ATOMIC_INIT(0);   // 不可恢复错误次数
     atomic_t     drop_count_      = ATOMIC_INIT(0);   // 业务计数
     uint64_t     run_cycles_      = 0;                // 累计执行周期（仅工作线程写）
     uint64_t     max_run_cycles_  = 0;                // 单次最长执行周期（仅工作线程写）
@@ -296,32 +301,24 @@ private:
             const TaskResult result = task_(context_);
 
             const uint64_t elapsed = k_cycle_get_64() - begin_cycle;
-            run_cycles_ += elapsed;
+            run_cycles_ 	+= elapsed;
             last_run_cycles_ = elapsed;
 
             if (elapsed > max_run_cycles_) {
                 max_run_cycles_ = elapsed;
             }
 
-            switch (result)
-            {
-                case TaskResult::Continue:
-                    break;
-
-                case TaskResult::Fatal:
-                    atomic_inc(&fatal_count_);
-                    DUST_LOG_ERR("thread %s fatal", Name());
+            if (result == TaskResult::Retry) 
+			{
+                atomic_inc(&retry_count_);
+                if (hook_ == nullptr || !hook_(context_)) 
+				{
                     return;
-
-                case TaskResult::Retry:
-                    atomic_inc(&retry_count_);
-                    if (hook_ == nullptr || !hook_(context_)) {
-                        return;
-                    }
-                    break;
+                }
             }
 
-            if (!K_TIMEOUT_EQ(period_, K_NO_WAIT)) {
+            if (!K_TIMEOUT_EQ(period_, K_NO_WAIT)) 
+			{
                 k_sleep(period_);               // 周期等待
             }
         }
