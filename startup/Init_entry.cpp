@@ -1,9 +1,9 @@
 /**
  * @file Init_entry.cpp
  * @author qingyu
- * @brief 统一启动实现：注册表遍历、失败回滚与启动中止记录
- * @version 0.9
- * @date 2026-10-20
+ * @brief 统一启动实现：初始化阶段与线程启动阶段分段执行、失败回滚与启动中止记录
+ * @version 1.0
+ * @date 2026-10-23
  *
  * @copyright Copyright (c) 2026
  *
@@ -12,12 +12,11 @@
 #include "Init_entry.hpp"
 #include "System_startup.h"
 #include "boot_timing.hpp"
-#include "thread_registry.hpp"
 #include "buzzer.hpp"
 #include "log.hpp"
 #include <zephyr/kernel.h>
 
-static bool startup_aborted_ = false;  		 			// 启动中止标志（线程启动失败时置位）
+static bool startup_aborted_ = false;  		 			// 启动中止标志（线程启动失败时置位，两个阶段都检查）
 
 namespace {
 
@@ -29,32 +28,23 @@ uint8_t           inited_count = 0;
 } // namespace
 
 /**
- * @brief 线程登记入口：Thread::Start 创建线程后调用
- * @param thread 已创建的线程对象
- */
-void RegisterThreadInstance(ThreadBase* thread)
-{
-    (void)thread_registry::Add(thread);
-}
-
-/**
  * @brief 停机前逆序回滚已成功初始化项
  *
- * cleanup 须支持「成功初始化后调用」场景（关闭输出、设备进低功耗等），
+ * rollback 须支持「成功初始化后调用」场景（关闭输出、设备进低功耗等），
  * 而不只是部分初始化失败的回滚。
  */
 static void RollbackInitedEntries()
 {
     for (int i = static_cast<int>(inited_count) - 1; i >= 0; --i)
     {
-        if (inited_entries[i]->cleanup != nullptr)
+        if (inited_entries[i]->rollback != nullptr)
         {
-            inited_entries[i]->cleanup();
+            inited_entries[i]->rollback();
             DUST_LOG_WRN("[boot] %s rolled back", inited_entries[i]->name);
         }
         else
         {
-            DUST_LOG_WRN("[boot] %s has no cleanup", inited_entries[i]->name);
+            DUST_LOG_WRN("[boot] %s has no rollback", inited_entries[i]->name);
         }
     }
 }
@@ -69,7 +59,7 @@ static void RollbackInitedEntries()
  */
 static void HandleInitFail(const InitEntry& entry)
 {
-    bool halt = (entry.fail == InitFailPolicy::HaltOnFail);
+    bool halt = (entry.fail == StartFailPolicy::HaltOnFail);
 
     // 失败横幅：HaltOnFail 红色 ERR、ContinueOnFail 橘色 WRN
     if (halt) {
@@ -78,7 +68,7 @@ static void HandleInitFail(const InitEntry& entry)
         DUST_LOG_WRN("[boot] %s fail", entry.name);
     }
 
-    if (halt) 
+    if (halt)
 	{
         RollbackInitedEntries();                 	// 停机前把硬件放回安全态
         EXEC_BUZZER_LONG();                         // 长鸣两声即返回，不阻塞日志发送
@@ -90,7 +80,7 @@ static void HandleInitFail(const InitEntry& entry)
 }
 
 /**
- * @brief 阶段内执行顺序：同一阶段先跑 High、再 Mid、最后 Low
+ * @brief 初始化阶段内的执行顺序：同一阶段先跑 High、再 Mid、最后 Low
  */
 static constexpr InitLevel kLevelOrder[] = {
     InitLevel::High,
@@ -101,7 +91,7 @@ static constexpr InitLevel kLevelOrder[] = {
 /**
  * @brief 初始化阶段名（启动横幅用）
  */
-static const char* StageName(InitStage stage)
+static const char* InitStageName(InitStage stage)
 {
     switch (stage)
     {
@@ -115,30 +105,14 @@ static const char* StageName(InitStage stage)
 }
 
 /**
- * @brief 线程阶段名（启动横幅用）
- */
-static const char* StageName(ThreadStage stage)
-{
-    switch (stage)
-    {
-        case ThreadStage::PreThread:   return "PreThread";
-        case ThreadStage::EarlyThread: return "EarlyThread";
-        case ThreadStage::MidThread:   return "MidThread";
-        case ThreadStage::LateThread:  return "LateThread";
-        case ThreadStage::AppThread:   return "AppThread";
-        default:                       return "?";
-    }
-}
-
-/**
  * @brief 执行一个初始化阶段：同阶段内按 High → Mid → Low 三轮遍历
  *
- * 每项执行前后计时并写入耗时槽。失败项先调 cleanup 回滚，再交给
+ * 每项执行前后计时并写入耗时槽。失败项先调 rollback 回滚，再交给
  * HandleInitFail 按策略处理；成功项登记到已完成表，供停机时逆序回滚。
  *
  * @param stage 当前初始化阶段
  */
-static void RunStage(InitStage stage)
+static void RunInitStage(InitStage stage)
 {
     if (startup_aborted_) return;                        // 启动已中止：不再执行后续阶段
 
@@ -157,14 +131,14 @@ static void RunStage(InitStage stage)
             if (e->level != level) {
                 continue;
             }
-            const uint64_t begin_cycle = k_cycle_get_64();
-            const bool     ok          = e->function();
-            BootTiming::Record(e->timing,
-                               static_cast<uint32_t>(k_cyc_to_ns_floor64(k_cycle_get_64() - begin_cycle)),
-                               ok);
 
-            if (!ok) {
-                if (e->cleanup != nullptr) e->cleanup();    	// 部分初始化失败也回滚本项资源
+            const uint64_t begin_cycle = k_cycle_get_64();
+            const bool     ok          = e->init();
+            BootTiming::Record(e->timing, static_cast<uint32_t>(k_cyc_to_ns_floor64(k_cycle_get_64() - begin_cycle)), ok);
+
+            if (!ok) 
+			{
+                if (e->rollback != nullptr) e->rollback();    	// 部分初始化失败也回滚本项资源
                 HandleInitFail(*e);
                 continue;                      				 	// 失败：不打印初始化提示
             }
@@ -181,7 +155,23 @@ static void RunStage(InitStage stage)
 
     // 阶段横幅：阶段内条目全部执行完再打印（此时 DUST_LOG 已初始化，PreInit 完成也能出），
     // 表示哪个阶段初始化完成
-    DUST_LOG_OK("=====     [boot] %s ok     =====\n", StageName(stage));
+    DUST_LOG_OK("=====     [boot] %s ok     =====\n", InitStageName(stage));
+}
+
+/**
+ * @brief 线程阶段名（启动横幅用）
+ */
+static const char* ThreadStageName(ThreadStage stage)
+{
+    switch (stage)
+    {
+        case ThreadStage::PreThread:   return "PreThread";
+        case ThreadStage::EarlyThread: return "EarlyThread";
+        case ThreadStage::MidThread:   return "MidThread";
+        case ThreadStage::LateThread:  return "LateThread";
+        case ThreadStage::AppThread:   return "AppThread";
+        default:                       return "?";
+    }
 }
 
 /**
@@ -193,7 +183,7 @@ static void RunStage(InitStage stage)
  *
  * @param stage 当前线程阶段
  */
-static void RunStage(ThreadStage stage)
+static void RunThreadStage(ThreadStage stage)
 {
     if (startup_aborted_) return;                        // 启动已中止：不再启动后续线程
 
@@ -209,12 +199,12 @@ static void RunStage(ThreadStage stage)
         }
 
         const uint64_t begin_cycle = k_cycle_get_64();
-        const bool ok  = e->start();
+        const bool ok = e->start();
         BootTiming::Record(e->timing, static_cast<uint32_t>(k_cyc_to_ns_floor64(k_cycle_get_64() - begin_cycle)), ok);
 
         if (!ok)                       							// 线程启动失败：按策略处理
         {
-            if (e->fail == InitFailPolicy::HaltOnFail)
+            if (e->fail == StartFailPolicy::HaltOnFail)
             {
                 DUST_LOG_ERR("[boot] %s start fail, halting", e->name);
                 startup_aborted_ = true;
@@ -229,7 +219,7 @@ static void RunStage(ThreadStage stage)
     }
 
     // 阶段横幅：线程阶段全部启动完再打印
-    DUST_LOG_OK("=====     [boot] %s ok     =====\n", StageName(stage));
+    DUST_LOG_OK("=====     [boot] %s ok     =====\n", ThreadStageName(stage));
 }
 
 /**
@@ -247,33 +237,33 @@ void System_Startup(void)
 {
     constexpr uint16_t kNormalStageDelayMs = 500;
 
-    RunStage(InitStage::PreInit);
+    RunInitStage(InitStage::PreInit);
     k_msleep(kNormalStageDelayMs);
-    RunStage(ThreadStage::PreThread);
-    k_msleep(kNormalStageDelayMs);
-    EXEC_BUZZER_SHORT();
-
-    RunStage(InitStage::EarlyInit);
-    k_msleep(kNormalStageDelayMs);
-    RunStage(ThreadStage::EarlyThread);
+    RunThreadStage(ThreadStage::PreThread);
     k_msleep(kNormalStageDelayMs);
     EXEC_BUZZER_SHORT();
 
-    RunStage(InitStage::MidInit);
+    RunInitStage(InitStage::EarlyInit);
     k_msleep(kNormalStageDelayMs);
-    RunStage(ThreadStage::MidThread);
-    k_msleep(kNormalStageDelayMs);
-    EXEC_BUZZER_SHORT();
-
-    RunStage(InitStage::LateInit);
-    k_msleep(kNormalStageDelayMs);
-    RunStage(ThreadStage::LateThread);
+    RunThreadStage(ThreadStage::EarlyThread);
     k_msleep(kNormalStageDelayMs);
     EXEC_BUZZER_SHORT();
 
-    RunStage(InitStage::AppInit);
+    RunInitStage(InitStage::MidInit);
     k_msleep(kNormalStageDelayMs);
-    RunStage(ThreadStage::AppThread);
+    RunThreadStage(ThreadStage::MidThread);
+    k_msleep(kNormalStageDelayMs);
+    EXEC_BUZZER_SHORT();
+
+    RunInitStage(InitStage::LateInit);
+    k_msleep(kNormalStageDelayMs);
+    RunThreadStage(ThreadStage::LateThread);
+    k_msleep(kNormalStageDelayMs);
+    EXEC_BUZZER_SHORT();
+
+    RunInitStage(InitStage::AppInit);
+    k_msleep(kNormalStageDelayMs);
+    RunThreadStage(ThreadStage::AppThread);
 }
 
 /**

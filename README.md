@@ -47,9 +47,12 @@ init/
 │   ├── boot_timing.cpp
 │   ├── System_startup.h
 │   └── main.cpp
-├── thread/                   线程模板与注册表
+├── thread/                   线程模板、故障处置与注册表
 │   ├── thread.hpp
-│   └── thread_registry.hpp
+│   ├── thread_fault.hpp
+│   ├── thread_fault.cpp
+│   ├── thread_registry.hpp
+│   └── thread_registry.cpp
 ├── irq/                      中断分发
 │   ├── Irq_handlers.h
 │   └── Irq_handlers.cpp
@@ -66,8 +69,11 @@ init/
 | `startup/boot_timing.hpp` | `BootTimingSlot` 结构与耗时槽写入/遍历接口 |
 | `startup/boot_timing.cpp` | `.boot_timing` 段边界遍历实现 |
 | `startup/main.cpp` | 系统入口：启动 + 中止检查 + 空转 |
-| `thread/thread.hpp` | 线程模板（创建 / 暂停恢复 / 受管任务外壳 / 运行统计） |
+| `thread/thread.hpp` | 线程模板（创建 / 暂停恢复 / 受管任务外壳 / 运行统计 / 退出） |
+| `thread/thread_fault.hpp` | 故障策略、Retry 钩子、退出钩子与默认处置函数声明 |
+| `thread/thread_fault.cpp` | 默认处置实现：`Isolate` 自杀、`Recover` 全杀 |
 | `thread/thread_registry.hpp` | 已启动线程登记表，供 shell 的 `thread` 命令遍历 |
+| `thread/thread_registry.cpp` | 登记表的增删查实现 |
 | `irq/Irq_handlers.h` | 定义 `CAN_RX_HANDLER()` 和 CAN RX 分发入口 |
 | `irq/Irq_handlers.cpp` | 根据 CAN ID 遍历 `.can_rx1/2/3` 并调用回调 |
 | `CMakeLists.txt` | 编译启动层源文件、加入三个子目录 include、接入两个链接脚本 |
@@ -77,7 +83,7 @@ init/
 | 目录 | 管什么 | 不管什么 |
 | --- | --- | --- |
 | `startup/` | 阶段顺序、注册表遍历、失败策略、程序入口 | 线程生命周期、中断分发 |
-| `thread/` | 线程创建、暂停/恢复、受管任务外壳、运行统计 | 业务逻辑、启动顺序 |
+| `thread/` | 线程创建、暂停/恢复、受管任务外壳、运行统计、故障处置与退出 | 业务逻辑、启动顺序 |
 | `irq/` | CAN RX 链接段分发 | CAN 设备初始化、过滤器、IRQ 使能 |
 
 三个子目录的全部 include 由 `init/CMakeLists.txt` 统一加入全局 include，
@@ -396,32 +402,7 @@ init/startup/Init_entry.cpp
 
 > 从注册宏到 Task 的一层层细节（编译期 / 链接期 / 启动期 / 运行期）见 `doc/线程编写指南.md`。
 
-`Thread<StackSize>` 封装 `k_thread`，有两种用法。
-
-### 裸任务
-
-任务入口是 `void(void*, void*, void*)`，函数自己写循环：
-
-```cpp
-static Thread<2048> thread_ {};
-
-static void Task(void*, void*, void*)
-{
-    for (;;)
-    {
-        k_msleep(10);
-        ...
-    }
-}
-
-thread_.Start(Task, ThreadPrio::High, nullptr, "foo");
-```
-
-适用于**事件驱动**线程（等信号量、等队列）或需要在循环里维护自有状态机的线程。
-
-### 受管任务（推荐用于周期线程）
-
-任务体只写「一拍」，循环、周期等待、统计全部由外壳负责：
+`Thread<StackSize>` 封装 `k_thread`，任务入口一律是受管形式：`Task` 只写「一拍」，循环、周期等待、统计与故障处置全部由外壳负责。
 
 ```cpp
 static Thread<2048> thread_ {};
@@ -435,48 +416,113 @@ static TaskResult Task(void* context)
 thread_.Start(Task, K_MSEC(10), ThreadPrio::High, nullptr, "foo");
 ```
 
-`TaskResult` 四态：
+`Start` 的参数顺序：**任务函数 / 周期 / 优先级 / 上下文 / 线程名**。周期传 `K_NO_WAIT` 表示不等，节拍由 Task 内部的阻塞点（如 `k_sem_take`）决定。
+
+`TaskResult` 两态：
 
 | 值 | 外壳行为 | 统计 |
 | --- | --- | --- |
 | `Continue` | 等一个周期后重进任务 | — |
-| `Retry` | 调恢复钩子，返回 `true` 则重进任务 | `retry_count++` |
-| `Fatal` | 打 ERR 日志后线程退出 | `fatal_count++` |
+| `Retry` | 先调 Retry 钩子；钩子返回 `true` 则重进任务，`false` 则交给故障处置 | `retry_count++` |
 
-`TaskResult` 只有三个值——MCU 上线程常驻，没有「任务主动结束」的场景。
-
-### 恢复钩子
-
-任务返回 `Retry` 时调用，用于「设备掉线后重连」这类场景：
-
-```cpp
-static bool Recover(void* context)
-{
-    if (device_.Reopen()) return true;   // 重进任务
-    return false;                        // 放弃，线程退出
-}
-
-thread_.SetRecoveryHook(Recover);
-thread_.Start(Task, K_MSEC(10), ThreadPrio::High, &device_, "foo");
-```
+`TaskResult` 只有两个值——MCU 上线程常驻，没有「任务主动结束」的场景，正常结束与可恢复错误本来就该由业务自己按拍处理。
 
 **契约**：Task 每拍重新进入函数，跨拍状态必须放在函数外的 static 或类成员里。
 
+### 故障处置：策略与两个钩子
+
+线程出故障（`Task` 返回 `Retry` 且自己处理不了）时，由故障处置链路决定生死。每个线程在 `Start` 前用 `SetFaultPolicy()` 声明自己的影响面：
+
+| 策略 | 影响面 | 处置 | 系统后续 |
+| --- | --- | --- | --- |
+| `Isolate` | 小（心跳、测试） | **自杀**：ExitHook → 注销注册表 → 打日志 → 终止自己 | 其他线程照常运行 |
+| `Recover` | 大（姿态、遥控） | **全杀**：长鸣 → 所有线程逐个走 Exit 流程 | 系统静止，保留现场 |
+
+处置链是两级：
+
+```text
+Task 返回 Retry
+      ↓
+RetryHook(context)          ← 一级：线程自己就地处理，回答「扛住了吗」
+      ↓ false / 没装钩子
+DefaultHandle(thread)       ← 二级：按 FaultPolicy 兜底
+      ↓
+Isolate -> thread->Exit()   Recover -> Halt() 全杀
+```
+
+`DefaultHandle` 是**弱符号**，项目可以在自己的编译单元里重定义同名函数整体替换默认策略。
+
+### Retry 钩子
+
+任务返回 `Retry` 时优先调用，用于「设备掉线后可重连」这类场景：
+
+```cpp
+static bool OnRetry(void* context)
+{
+    return true;                        // 扛住了，重进任务
+}
+
+thread_.SetRetryHook(OnRetry);
+thread_.SetFaultPolicy(ThreadFaultPolicy::Recover);
+thread_.Start(Task, K_MSEC(10), ThreadPrio::High, &device_, "foo");
+```
+
+返回 `false` 表示钩子处理不了，故障继续上报给 `DefaultHandle`。
+
+### 退出钩子
+
+`ExitHook` 在线程确定退出前执行一次，用于放掉本线程占用的资源：
+
+```cpp
+static void OnExit(void* context)
+{
+    ...
+}
+
+thread_.SetExitHook(OnExit);
+```
+
+它和启动期的 `cleanup` 不是一回事：`cleanup` 服务**初始化失败回滚**，`ExitHook` 服务**线程退出收尾**。三套生命周期钩子因此分成三个名字：
+
+| 钩子 | 签名 | 回答的问题 |
+| --- | --- | --- |
+| `RollbackFunc`（`REGISTER_INIT` 的 cleanup 参数） | `void (*)()` | 初始化失败后怎么退回去 |
+| `RetryHook` | `bool (*)(void* context)` | 这一拍的错误扛住了吗 |
+| `ExitHook` | `void (*)(void* context)` | 线程要死了，收尾吧 |
+
+### 退出：`Exit()`
+
+`ThreadBase::Exit()` 是唯一的终止路径，任意上下文都能调：
+
+```text
+ExitHook(context) -> 注销注册表 -> 打日志 -> k_thread_abort
+```
+
+- 自己调 = 自杀，内核切走，不返回；
+- 别的线程调 = 处决目标线程，处理完返回，目标已是 dead。
+
+被处决线程的 `ExitHook` 在**调用者上下文**执行（`k_thread_abort` 不会给目标线程执行机会），因此 `ExitHook` 只能操作 `context` 里的成员，不能依赖本线程局部状态。
+
+带保留标记的线程（`SetKeepAlive(true)`，当前只有 shell）在 `Recover` 全杀时**最后才处理**，保证收尾日志发得出去，也为停机现场留一个观察窗口。
+
 ### 运行统计
 
-受管任务的每次调用都会自动统计：运行次数、Retry/Fatal 次数、单次与累计耗时、栈剩余量。裸任务不参与统计（没有外壳）。
+每次任务调用自动统计：运行次数、Retry 次数、业务丢帧计数、单次与累计耗时、栈剩余量。
 
 ### shell 命令
 
 ```text
-thread list             所有已启动线程：名字 / 状态 / run / retry / fatal / exit / drop / 栈剩余
+thread list             所有已启动线程：名字 / 状态 / run / retry / drop / 栈剩余
 thread show <name>      单线程详细统计（含 last / max / total 耗时）
 thread pause <name>     暂停线程（内核不再调度，栈与局部变量全部保留）
 thread resume <name>    从暂停处继续执行
+thread exit <name>      终止线程（走 ExitHook → 注销注册表 → 打日志 → k_thread_abort）
 thread reset <name>     清零运行计数器（不影响暂停状态）
 ```
 
 `pause` / `resume` 走 `k_thread_suspend` / `k_thread_resume`，是内核级挂起。被暂停的线程如果持有互斥量，等待该互斥量的线程会一直阻塞；当前工程只使用短临界区，所以是安全的。
+
+`list` 的数据源是 `thread_registry`：线程在 `Start` 时登记、在 `Exit` 时移除，因此**已退出的线程不会出现在列表里**，表满时只在日志里留一条警告。
 
 ---
 

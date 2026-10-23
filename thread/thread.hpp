@@ -1,9 +1,9 @@
 /**
  * @file thread.hpp
  * @author qingyu
- * @brief Zephyr 线程模板，封装线程创建、暂停/恢复、受管任务外壳与运行统计
- * @version 0.8
- * @date 2026-10-22
+ * @brief Zephyr 线程模板，封装线程创建、暂停/恢复、受管任务外壳、运行统计与终止
+ * @version 0.9
+ * @date 2026-10-23
  *
  * @copyright Copyright (c) 2026
  *
@@ -14,6 +14,9 @@
 #include <zephyr/kernel.h>
 #include <cstdint>
 #include <cstring>
+#include "thread_fault.hpp"     // ThreadFaultPolicy / RetryHook / ExitHook / DefaultHandle
+#include "thread_registry.hpp"  // 线程登记表
+#include "log.hpp"              // Exit 的退出日志 / 注册表满的警告
 
 /**
  * @brief 线程优先级（Zephyr 数值越小优先级越高）
@@ -35,11 +38,10 @@ enum class ThreadPrio : uint8_t
 enum class TaskResult : uint8_t
 {
     Continue = 0,   				// 本拍正常结束：外壳等下一拍再调一次
-    Retry    = 1,   				// 可恢复错误：交给恢复钩子
+    Retry    = 1,   				// 可恢复错误：先交给 RetryHook，处理不了再交给 DefaultHandle
 };
 
-using TaskFunc     = TaskResult (*)(void* context);
-using RecoveryHook = bool (*)(void* context);
+using TaskFunc = TaskResult (*)(void* context);
 
 /**
  * @brief 线程运行统计快照
@@ -72,7 +74,7 @@ public:
     virtual void        ResetStats() = 0;
 
     /**
-     * @brief 设置「保留标记」：致命错误冻结线程时不暂停本线程
+     * @brief 设置「保留标记」：Recover 全杀时保留本线程
      * @param on true=保留（如 shell 调试通道）
      */
     virtual void SetKeepAlive(bool on) = 0;
@@ -96,16 +98,22 @@ public:
      * @brief 是否处于暂停状态
      */
     virtual bool Paused() const = 0;
+
+    /**
+     * @brief 终止线程：挂起 → 执行 ExitHook → 注销注册表 → 打日志 → k_thread_abort
+     *
+     * 任意上下文可调：自己调即自杀（不返回），其他线程调即处决目标线程。
+     */
+    virtual void Exit() = 0;
+
+    /**
+     * @brief 本线程的故障策略
+     */
+    virtual ThreadFaultPolicy FaultPolicy() const = 0;
 };
 
 /**
- * @brief 线程登记入口（定义在 Init_entry.cpp，供 Thread::Start 调用）
- * @param thread 已创建的线程对象
- */
-void RegisterThreadInstance(ThreadBase* thread);
-
-/**
- * @brief 线程模板，封装 k_thread 创建、暂停/恢复和受管任务外壳
+ * @brief 线程模板，封装 k_thread 创建、暂停/恢复、受管任务外壳与终止
  *
  * @tparam StackSize 线程栈大小
  */
@@ -125,29 +133,76 @@ public:
      */
     void Start(TaskFunc entry, k_timeout_t period, ThreadPrio prio, void* context, const char* name)
     {
-        task_    = entry;
-        period_  = period;
-        context_ = context;
+        task_.entry   = entry;
+        task_.period  = period;
+        task_.context = context;
 
-        atomic_clear(&paused_);
+        atomic_clear(&run_.paused);
 
-        name_ = name;
+        task_.name = name;
         k_thread_create(&thread_, stack_, K_THREAD_STACK_SIZEOF(stack_), RunEntry, this, nullptr, nullptr, static_cast<uint8_t>(prio), 0, K_NO_WAIT);
 
-        atomic_set(&started_, 1);
+        atomic_set(&run_.started, 1);
 
         if (name != nullptr) {
             k_thread_name_set(&thread_, name);
         }
 
-        RegisterThreadInstance(this);   // 登记到注册表，供 shell 的 thread 命令遍历
+        // 登记到注册表，供 shell 的 thread 命令遍历；表满只在日志里留痕，不影响线程启动
+        if (!thread_registry::Add(this)) {
+            DUST_LOG_WRN("[boot] thread registry full, %s not visible to shell", Name());
+        }
     }
 
     /**
-     * @brief 注册恢复钩子：任务返回 Retry 时调用
-     * @param hook true=重进任务入口；false=线程退出
+     * @brief 注册 Retry 钩子：Task 返回 Retry 时就地处理
+     * @param hook true=已处理继续；false=处理不了，交给 DefaultHandle
      */
-    void SetRecoveryHook(RecoveryHook hook) { hook_ = hook; }
+    void SetRetryHook(RetryHook hook) { fault_.retry_hook = hook; }
+
+    /**
+     * @brief 注册退出钩子（亡语）：线程临死前最后一次发言
+     *
+     * 只负责收尾与交代后事（降级、清状态、发消息），不负责杀线程。
+     * 自杀与被其他线程处决都会执行；执行完由 Exit() 注销注册表并终止线程。
+     *
+     * @param hook 收尾函数；nullptr 表示无需收尾
+     */
+    void SetExitHook(ExitHook hook)   { fault_.exit_hook = hook;  }
+
+    /**
+     * @brief 声明本线程的故障策略（影响面）
+     * @param policy Isolate=收尾后自杀 / Recover=全杀（保留标记的线程除外）
+     */
+    void SetFaultPolicy(ThreadFaultPolicy policy)  { fault_.policy = policy; }
+
+    /**
+     * @brief 本线程的故障策略
+     */
+    ThreadFaultPolicy FaultPolicy() const override { return fault_.policy;   }
+
+    /**
+     * @brief 终止线程：挂起 → 执行 ExitHook → 注销注册表 → 打日志 → k_thread_abort
+     *
+     * 自己调用即自杀（内核切走，不返回）；其他线程调用即处决目标线程。
+     * 他杀时先挂起目标，亡语期间它不可能再被调度，避免收尾与运行交错。
+     */
+    void Exit() override
+    {
+        if (k_current_get() != &thread_) {
+            k_thread_suspend(&thread_);     // 他杀：先冻住，亡语期间不会运行
+        }
+
+        if (fault_.exit_hook != nullptr) {
+            fault_.exit_hook(task_.context);
+        }
+
+        (void)thread_registry::Remove(this);
+
+        DUST_LOG_WRN("thread %s exited", Name());
+
+        k_thread_abort(&thread_);
+    }
 
     /**
      * @brief 暂停线程：内核不再调度，栈与局部变量全部保留
@@ -157,10 +212,10 @@ public:
      */
     void Pause() override
     {
-        if (atomic_get(&paused_) || !atomic_get(&started_)) return;
+        if (atomic_get(&run_.paused) || !atomic_get(&run_.started)) return;
 
         k_thread_suspend(&thread_);
-        atomic_set(&paused_, 1);
+        atomic_set(&run_.paused, 1);
     }
 
     /**
@@ -168,10 +223,10 @@ public:
      */
     void Resume() override
     {
-        if (!atomic_get(&paused_)) return;
+        if (!atomic_get(&run_.paused)) return;
 
         k_thread_resume(&thread_);
-        atomic_clear(&paused_);
+        atomic_clear(&run_.paused);
     }
 
     /**
@@ -179,7 +234,7 @@ public:
      */
     bool Paused() const override
 	{
-		return atomic_get(&paused_) != 0;
+		return atomic_get(&run_.paused) != 0;
 	}
 
     /**
@@ -187,7 +242,7 @@ public:
      */
     const char* Name() const override
 	{
-		return (name_ != nullptr) ? name_ : "?";
+		return (task_.name != nullptr) ? task_.name : "?";
 	}
 
     /**
@@ -199,12 +254,12 @@ public:
 	}
 
     /**
-     * @brief 设置「保留标记」：致命错误冻结线程时不暂停本线程
+     * @brief 设置「保留标记」：Recover 全杀时保留本线程
      * @param on true=保留
      */
     void SetKeepAlive(bool on) override
 	{
-		atomic_set(&keep_alive_, on ? 1 : 0);
+		atomic_set(&run_.keep_alive, on ? 1 : 0);
 	}
 
     /**
@@ -212,15 +267,15 @@ public:
      */
     bool KeepAlive() const override
 	{
-		return atomic_get(&keep_alive_) != 0;
+		return atomic_get(&run_.keep_alive) != 0;
 	}
 
     /**
      * @brief 业务侧计数一次丢帧/丢包
      */
-    void CountDrop() 
-	{ 
-		atomic_inc(&drop_count_); 
+    void CountDrop()
+	{
+		atomic_inc(&stats_.drop_count);
 	}
 
     /**
@@ -228,13 +283,13 @@ public:
      */
     void ResetStats() override
     {
-        atomic_clear(&run_count_);
-        atomic_clear(&retry_count_);
-        atomic_clear(&drop_count_);
+        atomic_clear(&stats_.run_count);
+        atomic_clear(&stats_.retry_count);
+        atomic_clear(&stats_.drop_count);
 
-        run_cycles_      = 0;
-        max_run_cycles_  = 0;
-        last_run_cycles_ = 0;
+        stats_.run_cycles      = 0;
+        stats_.max_run_cycles  = 0;
+        stats_.last_run_cycles = 0;
     }
 
     /**
@@ -245,40 +300,59 @@ public:
     bool GetStats(ThreadStats& out) const override
     {
         out.name         = Name();
-        out.run_count    = static_cast<uint32_t>(atomic_get(&run_count_));
-        out.retry_count  = static_cast<uint32_t>(atomic_get(&retry_count_));
-        out.drop_count   = static_cast<uint32_t>(atomic_get(&drop_count_));
-        out.run_ns       = k_cyc_to_ns_floor64(run_cycles_);
-        out.max_run_ns   = k_cyc_to_ns_floor64(max_run_cycles_);
-        out.last_run_ns  = k_cyc_to_ns_floor64(last_run_cycles_);
+        out.run_count    = static_cast<uint32_t>(atomic_get(&stats_.run_count));
+        out.retry_count  = static_cast<uint32_t>(atomic_get(&stats_.retry_count));
+        out.drop_count   = static_cast<uint32_t>(atomic_get(&stats_.drop_count));
+        out.run_ns       = k_cyc_to_ns_floor64(stats_.run_cycles);
+        out.max_run_ns   = k_cyc_to_ns_floor64(stats_.max_run_cycles);
+        out.last_run_ns  = k_cyc_to_ns_floor64(stats_.last_run_cycles);
         out.running      = IsAlive();
         out.paused       = Paused();
         out.stack_unused = StackUnused();
 
-        return atomic_get(&started_) != 0;
+        return atomic_get(&run_.started) != 0;
     }
 
 private:
     k_thread thread_ {};
     K_KERNEL_STACK_MEMBER(stack_, StackSize);
 
-    atomic_t     paused_          = ATOMIC_INIT(0);   // 暂停标志
-    atomic_t     started_         = ATOMIC_INIT(0);   // 是否已创建
-    atomic_t     keep_alive_      = ATOMIC_INIT(0);   // fatal 冻结时保留（默认冻结）
+    struct
+    {
+        atomic_t paused      = ATOMIC_INIT(0);   					// 暂停标志
+        atomic_t started     = ATOMIC_INIT(0);   					// 是否已创建
+        atomic_t keep_alive  = ATOMIC_INIT(0);   					// Recover 全杀时保留
+    } run_;                                      					// 生命周期状态
 
-    TaskFunc     task_    		  = nullptr;   		  // 受管任务入口（裸任务为空）
-    k_timeout_t  period_          = K_NO_WAIT;        // 两拍间隔
-    void*        context_ 		  = nullptr;   		  // 任务上下文
-    const char*  name_    		  = nullptr;   		  // 线程名（日志与命令用）
-    RecoveryHook hook_    		  = nullptr;   		  // 恢复钩子（Retry 时调用）
+    struct
+    {
+        TaskFunc    entry   = nullptr;           					// 受管任务入口
+        k_timeout_t period  = K_NO_WAIT;         					// 两拍间隔
+        void       *context = nullptr;           					// 任务上下文
+        const char *name    = nullptr;           					// 线程名（日志与命令用）
+    } task_;                                     					// 任务配置
 
-    atomic_t     run_count_       = ATOMIC_INIT(0);   // 任务体进入次数
-    atomic_t     retry_count_     = ATOMIC_INIT(0);   // 可恢复错误次数
-    atomic_t     drop_count_      = ATOMIC_INIT(0);   // 业务计数
-    uint64_t     run_cycles_      = 0;                // 累计执行周期（仅工作线程写）
-    uint64_t     max_run_cycles_  = 0;                // 单次最长执行周期（仅工作线程写）
-    uint64_t     last_run_cycles_ = 0;                // 最近一次执行周期（仅工作线程写）
+    struct
+    {
+        RetryHook retry_hook   = nullptr;        					// Retry 处理钩子
+        ExitHook  exit_hook    = nullptr;        					// 退出收尾钩子
+        ThreadFaultPolicy policy = ThreadFaultPolicy::Recover;    	// 故障策略（默认按大影响）
+    } fault_;                                    					// 故障处置
 
+    struct
+    {
+        atomic_t run_count       = ATOMIC_INIT(0);   				// 任务体进入次数
+        atomic_t retry_count     = ATOMIC_INIT(0);   				// 可恢复错误次数
+        atomic_t drop_count      = ATOMIC_INIT(0);   				// 业务计数
+        uint64_t run_cycles      = 0;                				// 累计执行周期（仅工作线程写）
+        uint64_t max_run_cycles  = 0;                				// 单次最长执行周期（仅工作线程写）
+        uint64_t last_run_cycles = 0;                				// 最近一次执行周期（仅工作线程写）
+    } stats_;                                    	 				// 运行统计
+
+    /**
+     * @brief 内核线程入口：把 p1 还原成本对象，转入受管外壳
+     * @param p1 线程对象（Start 时传入 this）
+     */
     static void RunEntry(void* p1, void* p2, void* p3)
     {
         ARG_UNUSED(p2);
@@ -295,44 +369,52 @@ private:
     {
         for (;;)
         {
-            atomic_inc(&run_count_);
+            atomic_inc(&stats_.run_count);
             const uint64_t begin_cycle = k_cycle_get_64();
 
-            const TaskResult result = task_(context_);
+            const TaskResult result = task_.entry(task_.context);
 
             const uint64_t elapsed = k_cycle_get_64() - begin_cycle;
-            run_cycles_ 	+= elapsed;
-            last_run_cycles_ = elapsed;
+            stats_.run_cycles += elapsed;
+            stats_.last_run_cycles = elapsed;
 
-            if (elapsed > max_run_cycles_) {
-                max_run_cycles_ = elapsed;
+            if (elapsed > stats_.max_run_cycles) {
+                stats_.max_run_cycles = elapsed;
             }
 
-            if (result == TaskResult::Retry) 
-			{
-                atomic_inc(&retry_count_);
-                if (hook_ == nullptr || !hook_(context_)) 
-				{
-                    return;
+            if (result == TaskResult::Retry)
+            {
+                atomic_inc(&stats_.retry_count);
+
+                // 一级：Retry 钩子就地处理（钩子自己决定要不要节流打日志）
+                if (fault_.retry_hook == nullptr || !fault_.retry_hook(task_.context))
+                {
+                    // 二级：钩子处理不了 → 默认处置函数直接决定生死（不返回）
+                    DefaultHandle(this);
                 }
             }
 
-            if (!K_TIMEOUT_EQ(period_, K_NO_WAIT)) 
+            if (!K_TIMEOUT_EQ(task_.period, K_NO_WAIT))
 			{
-                k_sleep(period_);               // 周期等待
+                k_sleep(task_.period);               // 周期等待
             }
         }
     }
 
     /**
      * @brief 线程是否仍在运行
-     * @return true=未退出
+     *
+     * 未启动过的对象 thread_state 为 0，内核不会给出任何状态串，直接判死。
+     *
+     * @return true=已启动且未被 abort
      */
     bool IsAlive() const
     {
+        if (atomic_get(&run_.started) == 0) return false;
+
         char buf[32];
         const char* state = k_thread_state_str(const_cast<k_thread*>(&thread_), buf, sizeof(buf));
-        return (state != nullptr) && (std::strstr(state, "dead") == nullptr) && (std::strstr(state, "exited") == nullptr);
+        return (state != nullptr) && (std::strstr(state, "dead") == nullptr);
     }
 
     /**

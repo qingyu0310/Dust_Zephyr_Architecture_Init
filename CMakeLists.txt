@@ -4,6 +4,8 @@ target_sources(app PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/startup/Init_entry.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/startup/boot_timing.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/startup/main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread/thread_fault.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread/thread_registry.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/irq/Irq_handlers.cpp
 )
 

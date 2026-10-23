@@ -48,20 +48,9 @@ public:
         slot->ok = ok;
     }
 
-    /**
-     * @brief 槽总数（链接段长度 / 槽大小）
-     */
     static uint8_t Count();
 
-    /**
-     * @brief 按序号取槽
-     * @param index 序号（0 起）
-     * @return 槽指针；越界返回 nullptr
-     */
     static const BootTimingSlot* At(uint8_t index);
 
-    /**
-     * @brief 全部槽的总耗时（纳秒）
-     */
     static uint64_t TotalNs();
 };
