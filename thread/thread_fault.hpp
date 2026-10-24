@@ -1,9 +1,9 @@
 /**
  * @file thread_fault.hpp
  * @author qingyu
- * @brief 线程故障类型与默认处置函数
- * @version 0.3
- * @date 2026-10-23
+ * @brief 线程故障策略、钩子类型、配置结构与默认处置函数
+ * @version 0.5
+ * @date 2026-10-24
  *
  * @copyright Copyright (c) 2026
  *
@@ -19,7 +19,7 @@ class ThreadBase;
  * @brief 线程故障策略：声明本线程出故障时的影响面
  *
  * 同一个故障对不同线程的影响面不同：心跳挂了系统照跑，姿态挂了必须全停。
- * 线程在 Start 之前用 SetFaultPolicy() 声明，DefaultHandle() 据此决定处置方式。
+ * 线程在 Start() 时通过 ThreadFaultConfig 传入，DefaultHandle() 据此决定处置方式。
  */
 enum class ThreadFaultPolicy : uint8_t
 {
@@ -44,6 +44,20 @@ using RetryHook = bool (*)(void* context);
  * 与启动期的 RollbackFunc 无关：那个服务初始化回滚，这个服务线程退出。
  */
 using ExitHook = void (*)(void* context);
+
+/**
+ * @brief 线程故障配置
+ *
+ * 由 Thread::Start() 的第 6 个参数传入，与线程名同处一个调用点，
+ * 不再需要注册宏与按名字查表。
+ */
+struct ThreadFaultConfig
+{
+    RetryHook         retry      = nullptr;                        // Retry 钩子
+    ExitHook          exit       = nullptr;                        // 亡语
+    ThreadFaultPolicy policy     = ThreadFaultPolicy::Recover;     // 故障策略
+    bool              keep_alive = false;                          // Recover 全杀时是否保留
+};
 
 /**
  * @brief 默认故障处置函数：按线程声明的策略兜底

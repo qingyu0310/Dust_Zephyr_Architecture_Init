@@ -18,8 +18,9 @@
 - 定义 `REGISTER_INIT()` 和 `REGISTER_THREAD()`；
 - 遍历 `.user_init` 和 `.user_thread` 链接段；
 - 按阶段执行初始化函数和线程启动函数；
-- 按 `InitLevel` / `InitFailPolicy` 决定执行顺序与失败处理；
-- 初始化失败时逆序回滚已成功项（`cleanup`），把硬件放回安全态；
+- 按 `InitLevel` / `StartFailPolicy` 决定执行顺序与失败处理；
+- 初始化失败时逆序回滚已成功项（`rollback`），把硬件放回安全态；
+- 提供线程模板 `Thread<>`：受管任务外壳、运行统计、故障处置与终止；
 - 记录每项启动耗时，供 `boot timing` 命令查询；
 - 提供 CAN RX 链接段分发入口；
 - 将 `cmd/linker/dust_init.ld` 与 `cmd/linker/boot_timing.ld` 接入 Zephyr 链接流程。
@@ -70,8 +71,8 @@ init/
 | `startup/boot_timing.cpp` | `.boot_timing` 段边界遍历实现 |
 | `startup/main.cpp` | 系统入口：启动 + 中止检查 + 空转 |
 | `thread/thread.hpp` | 线程模板（创建 / 暂停恢复 / 受管任务外壳 / 运行统计 / 退出） |
-| `thread/thread_fault.hpp` | 故障策略、Retry 钩子、退出钩子与默认处置函数声明 |
-| `thread/thread_fault.cpp` | 默认处置实现：`Isolate` 自杀、`Recover` 全杀 |
+| `thread/thread_fault.hpp` | 故障策略、`ThreadFaultConfig`、Retry/退出钩子类型与 `DefaultHandle` 声明 |
+| `thread/thread_fault.cpp` | 默认处置实现（`Isolate` 自杀、`Recover` 全杀） |
 | `thread/thread_registry.hpp` | 已启动线程登记表，供 shell 的 `thread` 命令遍历 |
 | `thread/thread_registry.cpp` | 登记表的增删查实现 |
 | `irq/Irq_handlers.h` | 定义 `CAN_RX_HANDLER()` 和 CAN RX 分发入口 |
@@ -185,7 +186,7 @@ REGISTER_INIT(thread_init, MidInit, Mid, HaltOnFail, nullptr, "foo_init");
 
 段里存指针而不是结构体，遍历步长恒为 `sizeof(void*)`，与结构体字段增删无关。
 
-6 个参数的顺序是 **函数 / 阶段 / 等级 / 失败策略 / 清理函数 / 名称**。清理函数在初始化失败时被调用来回滚本项已申请的资源，没有可释放的资源就传 `nullptr`：
+6 个参数的顺序是 **函数 / 阶段 / 等级 / 失败策略 / 回滚函数 / 名称**。回滚函数在初始化失败时被调用来回滚本项已申请的资源，没有可释放的资源就传 `nullptr`：
 
 ```cpp
 static void foo_deinit() { /* 关闭本项打开的设备 */ }
@@ -272,7 +273,7 @@ BOOT TIMING (total 42 ms, 8 items)
 
 | 路径 | 触发 | 行为 |
 | --- | --- | --- |
-| 初始化项失败 | `REGISTER_INIT` 的 `function()` 返回 false | 先 `cleanup` 回滚本项，再按 `InitFailPolicy`：`HaltOnFail` 逆序回滚全部已成功项 + 长鸣 + 停机；`ContinueOnFail` 仅告警 |
+| 初始化项失败 | `REGISTER_INIT` 的 `init()` 返回 false | 先 `rollback` 回滚本项，再按 `StartFailPolicy`：`HaltOnFail` 逆序回滚全部已成功项 + 长鸣 + 停机；`ContinueOnFail` 仅告警 |
 | 线程启动失败 | `REGISTER_THREAD` 的 `start()` 返回 false | `HaltOnFail` 置 `startup_aborted`，后续所有阶段跳过；`ContinueOnFail` 告警后继续 |
 
 `System_Startup()` **保证返回**。线程启动失败只记录状态，由 `main.cpp` 查询
@@ -355,21 +356,41 @@ CAN_RX_HANDLER(USER_RX_CAN1, 0x201, motor_rx_handler, motor_201);
 
 ## 新增线程的接入方式
 
-一个典型项目线程应该在自己的 `trd_xxx.cpp` 中完成注册：
+一个典型项目线程应该在自己的 `trd_xxx.cpp` 中完成三个注册（启动、故障配置、可选的钩子要先定义）：
 
 ```cpp
 #include "Init_entry.hpp"
 
 namespace thread::foo {
 
-static bool thread_init()
+static Thread<1024> thread_ {};
+
+/**
+ * @brief Retry 钩子：设备掉线后重连
+ */
+static bool OnRetry(void* context)
 {
-    return Foo::Instance().Init();
+    return true;
 }
 
-static bool thread_start()
+/**
+ * @brief 亡语：线程临死前收尾
+ */
+static void OnExit(void* context)
 {
-    Foo::Instance().Start();
+}
+
+static TaskResult Task(void* context)
+{
+    return TaskResult::Continue;
+}
+
+bool thread_init()  { return true; }
+
+bool thread_start()
+{
+    thread_.Start(Task, K_MSEC(10), ThreadPrio::High, nullptr, "foo",
+                  ThreadFaultConfig{ OnRetry, OnExit, ThreadFaultPolicy::Recover });
     return true;
 }
 
@@ -378,6 +399,8 @@ REGISTER_THREAD(thread_start, MidThread, ContinueOnFail, "foo_start");
 
 }  // namespace thread::foo
 ```
+
+`ThreadFaultConfig` 的字段顺序是 **Retry 钩子 / 亡语 / 策略 / 保留标记**，与线程名同处一个 `Start()` 调用点，不会出现名字对不上的问题。
 
 新增线程通常还需要同步修改：
 
@@ -430,9 +453,22 @@ thread_.Start(Task, K_MSEC(10), ThreadPrio::High, nullptr, "foo");
 
 **契约**：Task 每拍重新进入函数，跨拍状态必须放在函数外的 static 或类成员里。
 
-### 故障处置：策略与两个钩子
+### 故障处置：注册宏 + 策略 + 两个钩子
 
-线程报 `Retry` 且自己处理不了，或直接报 `Exit` 时，由故障处置链路决定生死。每个线程在 `Start` 前用 `SetFaultPolicy()` 声明自己的影响面：
+线程报 `Retry` 且自己处理不了，或直接报 `Exit` 时，由故障处置链路决定生死。**故障配置作为 `Start()` 的第 6 个参数传入**，与线程名同处一个调用点：
+
+```cpp
+// 字段顺序：Retry 钩子 / 亡语 / 策略 / 保留标记
+thread_.Start(Task, K_MSEC(10), ThreadPrio::High, nullptr, "foo",
+              ThreadFaultConfig{ OnRetry, OnExit, ThreadFaultPolicy::Recover });
+```
+
+不传就是全默认（无钩子、`Recover`、不保留）：
+
+```cpp
+thread_.Start(Task, K_MSEC(1), ThreadPrio::Low, nullptr, "output",
+              ThreadFaultConfig{ nullptr, nullptr, ThreadFaultPolicy::Isolate });
+```
 
 | 策略 | 影响面 | 处置 | 系统后续 |
 | --- | --- | --- | --- |
@@ -453,6 +489,11 @@ RetryHook(context)                  （跳过钩子）
 
 `DefaultHandle` 是**弱符号**，项目可以在自己的编译单元里重定义同名函数整体替换默认策略。
 
+#### 配置机制的两个要点
+
+1. **配置与线程名同处一个调用点**，不存在「名字写错」的问题——名字只出现一次。
+2. **不传即全默认**：`ThreadFaultConfig{}` = 无钩子 + `Recover` + 不保留。想让线程在被全杀时活下来，显式传 `keep_alive = true`（当前只有 `shell` 这么做）。
+
 ### Retry 钩子
 
 任务返回 `Retry` 时优先调用（返回 `Exit` 时不经过它），用于「设备掉线后可重连」这类场景：
@@ -460,51 +501,65 @@ RetryHook(context)                  （跳过钩子）
 ```cpp
 static bool OnRetry(void* context)
 {
+    auto* self = static_cast<Foo*>(context);
+    self->ClearOutput();
     return true;                        // 扛住了，重进任务
 }
-
-thread_.SetRetryHook(OnRetry);
-thread_.SetFaultPolicy(ThreadFaultPolicy::Recover);
-thread_.Start(Task, K_MSEC(10), ThreadPrio::High, &device_, "foo");
 ```
 
 返回 `false` 表示钩子处理不了，故障继续上报给 `DefaultHandle`。
 
-### 退出钩子
+### 退出钩子（亡语）
 
-`ExitHook` 在线程确定退出前执行一次，用于放掉本线程占用的资源：
+`ExitHook` 在线程确定退出前执行一次，用于放掉本线程占用的资源、交代后事：
 
 ```cpp
 static void OnExit(void* context)
 {
-    ...
+    auto* self = static_cast<Foo*>(context);
+    self->heater_.Off();
+    self->pub_ = {};
 }
-
-thread_.SetExitHook(OnExit);
 ```
 
-它和启动期的 `cleanup` 不是一回事：`cleanup` 服务**初始化失败回滚**，`ExitHook` 服务**线程退出收尾**。三套生命周期钩子因此分成三个名字：
+它和启动期的 `rollback` 不是一回事：`rollback` 服务**初始化失败回滚**，`ExitHook` 服务**线程退出收尾**。三套生命周期钩子因此分成三个名字：
 
 | 钩子 | 签名 | 回答的问题 |
 | --- | --- | --- |
-| `RollbackFunc`（`REGISTER_INIT` 的 cleanup 参数） | `void (*)()` | 初始化失败后怎么退回去 |
+| `RollbackFunc`（`REGISTER_INIT` 的 rollback 参数） | `void (*)()` | 初始化失败后怎么退回去 |
 | `RetryHook` | `bool (*)(void* context)` | 这一拍的错误扛住了吗 |
 | `ExitHook` | `void (*)(void* context)` | 线程要死了，收尾吧 |
+
+### 保留标记 `KeepAlive`
+
+只有 `shell` 需要：它是日志的唯一消费者，也是停机后唯一的现场观察窗口，`Recover` 全杀时必须跳过它。
+
+`keep_alive` 是 `ThreadFaultConfig` 的字段之一，只有 `shell` 传 `true`：
+
+```cpp
+// framework/shell/shell.hpp
+thread_.Start(TaskEntry, K_NO_WAIT, prio, this, "shell",
+              ThreadFaultConfig{ nullptr, nullptr, ThreadFaultPolicy::Recover, true });
+```
+
+`Halt()` 遍历注册表时对带该标记的线程 `continue` 跳过，其余逐个走 `Exit()`；最后处决调用者自己。
 
 ### 退出：`Exit()`
 
 `ThreadBase::Exit()` 是唯一的终止路径，任意上下文都能调：
 
 ```text
-ExitHook(context) -> 注销注册表 -> 打日志 -> k_thread_abort
+[他杀先 k_thread_suspend] -> ExitHook(context) -> 注销注册表 -> 打日志 -> k_thread_abort
 ```
 
 - 自己调 = 自杀，内核切走，不返回；
 - 别的线程调 = 处决目标线程，处理完返回，目标已是 dead。
 
-被处决线程的 `ExitHook` 在**调用者上下文**执行（`k_thread_abort` 不会给目标线程执行机会），因此 `ExitHook` 只能操作 `context` 里的成员，不能依赖本线程局部状态。
+**他杀先挂起目标**：否则亡语执行的那几步里，目标线程可能被唤醒继续跑 `Task`，甚至重复进入 `Exit()`。用 `k_current_get() != &thread_` 区分自杀与他杀。
 
-带保留标记的线程（`SetKeepAlive(true)`，当前只有 shell）在 `Recover` 全杀时**最后才处理**，保证收尾日志发得出去，也为停机现场留一个观察窗口。
+不用 `irq_lock` 临界区的原因：`ExitHook` 是业务写的任意代码，临界区内不能阻塞（`k_msleep` / `k_mutex_lock` / 带超时的 `zbus_chan_pub` 都是非法用法），无法约定。
+
+被处决线程的 `ExitHook` 在**调用者上下文**执行（`k_thread_abort` 不会给目标线程执行机会），因此 `ExitHook` 只能操作 `context` 里的成员，不能依赖本线程局部状态。
 
 ### 运行统计
 
@@ -583,7 +638,8 @@ System_Startup() 的阶段遍历
 | `InitStage` | 初始化注册项 | 决定一次性初始化在哪个阶段执行 |
 | `ThreadStage` | 线程注册项 | 决定线程创建或启动请求在哪个阶段执行 |
 | `InitLevel` | 初始化注册项 | 同阶段执行顺序（High → Mid → Low）+ 失败等级 |
-| `InitFailPolicy` | 初始化注册项 | 决定返回 `false` 后是停机还是继续 |
+| `StartFailPolicy` | 初始化项与线程项共用 | 决定返回 `false` 后是停机还是继续 |
+| `ThreadFaultPolicy` | 线程故障配置项 | 决定运行期故障时自杀还是全杀 |
 | RTOS priority | 线程实现或创建参数 | 决定线程被调度时与其他线程的相对优先级 |
 | period / sleep | 线程循环 | 决定线程自身的运行周期 |
 
@@ -595,13 +651,13 @@ System_Startup() 的阶段遍历
 
 当前 `project/` 中的注册项可以按启动职责概括为：
 
-| 组件 | 初始化阶段 | 线程阶段 | 等级 | 作用 |
-| --- | --- | --- | --- | --- |
-| shell 调试台 | `PreInit` | `PreThread` | `High` | UART 接收 + log/var/thread 命令 |
-| GPIO 心跳 | `PreInit` | `PreThread` | `Low` | PA18 输出翻转 |
-| 遥控器 | `EarlyInit` | `EarlyThread` | `High` | UART 接收 + 协议自动探测 |
-| IMU | `EarlyInit` | `EarlyThread` | `High` | 采样、控温、姿态解算 |
-| 测试 | `LateInit` | `LateThread` | `High` | VOFA+ 波形输出 / 实验功能 |
+| 组件 | 线程名 | 初始化阶段 | 线程阶段 | 等级 | 故障策略 | 作用 |
+| --- | --- | --- | --- | --- | --- | --- |
+| shell 调试台 | `shell` | `PreInit` | `PreThread` | `High` | `Recover`（+`KeepAlive`） | UART 接收 + log/var/thread 命令 |
+| GPIO 心跳 | `output` | `PreInit` | `PreThread` | `Low` | `Isolate` | PA18 输出翻转 |
+| 遥控器 | `remote` | `EarlyInit` | `EarlyThread` | `High` | `Recover` + `OnRetry`/`OnExit` | UART 接收 + 协议自动探测 |
+| IMU | `imu` | `EarlyInit` | `EarlyThread` | `High` | `Recover` + `OnRetry`/`OnExit` | 采样、控温、姿态解算 |
+| 测试 | `test` | `LateInit` | `LateThread` | `High` | `Recover` + `OnRetry`/`OnExit` | 线程故障处置验证 |
 
 这张表描述当前项目的实际装配，不是所有项目都必须采用同样的线程集合。
 新增项目组件时，应根据真实依赖选择阶段和等级，而不是机械复制表格。
@@ -638,7 +694,7 @@ InitFunc()
 初始化函数应完成一次性资源准备，并返回明确结果：
 
 - `true` 表示当前启动项完成了它承诺的准备工作；
-- `false` 表示无法完成：先调本项的 `cleanup` 回滚资源，再由 `InitFailPolicy` 决定停机还是继续；
+- `false` 表示无法完成：先调本项的 `rollback` 回滚资源，再由 `StartFailPolicy` 决定停机还是继续；
 - 不应在初始化函数中放置无限循环；
 - 需要持续执行的功能应拆成线程注册项；
 - 初始化函数中的阻塞等待应有明确上限或可诊断状态。
@@ -682,8 +738,8 @@ InitFunc()
 | `.shell_var` | 调试变量注册项 | `var` 命令 |
 
 只有 `.user_init` 和 `.user_thread` 由通用阶段遍历直接消费。`.boot_timing`
-由启动器写入、由 `boot` 命令读取。CAN、remote、imu 和 shell section 有各自的
-消费者，不能把它们都当成启动表。
+由启动器写入、由 `boot` 命令读取。
+CAN、remote、imu 和 shell section 有各自的消费者，不能把它们都当成启动表。
 
 ## CAN RX 分发检查
 
@@ -721,6 +777,7 @@ handler(data)
 - [ ] 判断它需要一次性初始化、线程，还是现有模块的被动回调。
 - [ ] 选择合适的 stage、level、线程优先级和周期。
 - [ ] 在本地源文件中使用 `REGISTER_INIT()` / `REGISTER_THREAD()`。
+- [ ] 在 `Start()` 里传入 `ThreadFaultConfig`，声明故障策略与钩子。
 - [ ] 确认源文件受 Kconfig 和 CMake 控制。
 - [ ] 确认注册 section 被 `dust_init.ld` 保留。
 - [ ] 如果使用专用 section，确认存在对应消费者。

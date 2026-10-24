@@ -2,7 +2,7 @@
  * @file thread.hpp
  * @author qingyu
  * @brief Zephyr 线程模板，封装线程创建、暂停/恢复、受管任务外壳、运行统计与终止
- * @version 0.10
+ * @version 0.11
  * @date 2026-10-24
  *
  * @copyright Copyright (c) 2026
@@ -14,7 +14,7 @@
 #include <zephyr/kernel.h>
 #include <cstdint>
 #include <cstring>
-#include "thread_fault.hpp"     // ThreadFaultPolicy / RetryHook / ExitHook / DefaultHandle
+#include "thread_fault.hpp"     // ThreadFaultConfig / ThreadFaultPolicy / DefaultHandle
 #include "thread_registry.hpp"  // 线程登记表
 #include "log.hpp"              // Exit 的退出日志 / 注册表满的警告
 
@@ -75,12 +75,6 @@ public:
     virtual void        ResetStats() = 0;
 
     /**
-     * @brief 设置「保留标记」：Recover 全杀时保留本线程
-     * @param on true=保留（如 shell 调试通道）
-     */
-    virtual void SetKeepAlive(bool on) = 0;
-
-    /**
      * @brief 是否带保留标记
      */
     virtual bool KeepAlive() const = 0;
@@ -131,12 +125,15 @@ public:
      * @param prio    线程优先级
      * @param context 任务上下文（每拍原样传回）
      * @param name    线程名
+     * @param fault   故障配置（钩子 / 策略 / 保留标记），不传即全默认
      */
-    void Start(TaskFunc entry, k_timeout_t period, ThreadPrio prio, void* context, const char* name)
+    void Start(TaskFunc entry, k_timeout_t period, ThreadPrio prio, void* context, const char* name, const ThreadFaultConfig& fault = {})
     {
         task_.entry   = entry;
         task_.period  = period;
         task_.context = context;
+
+        fault_ = fault;
 
         atomic_clear(&run_.paused);
 
@@ -156,28 +153,6 @@ public:
     }
 
     /**
-     * @brief 注册 Retry 钩子：Task 返回 Retry 时就地处理
-     * @param hook true=已处理继续；false=处理不了，交给 DefaultHandle
-     */
-    void SetRetryHook(RetryHook hook) { fault_.retry_hook = hook; }
-
-    /**
-     * @brief 注册退出钩子（亡语）：线程临死前最后一次发言
-     *
-     * 只负责收尾与交代后事（降级、清状态、发消息），不负责杀线程。
-     * 自杀与被其他线程处决都会执行；执行完由 Exit() 注销注册表并终止线程。
-     *
-     * @param hook 收尾函数；nullptr 表示无需收尾
-     */
-    void SetExitHook(ExitHook hook)   { fault_.exit_hook = hook;  }
-
-    /**
-     * @brief 声明本线程的故障策略（影响面）
-     * @param policy Isolate=收尾后自杀 / Recover=全杀（保留标记的线程除外）
-     */
-    void SetFaultPolicy(ThreadFaultPolicy policy)  { fault_.policy = policy; }
-
-    /**
      * @brief 本线程的故障策略
      */
     ThreadFaultPolicy FaultPolicy() const override { return fault_.policy;   }
@@ -194,8 +169,8 @@ public:
             k_thread_suspend(&thread_);     // 他杀：先冻住，亡语期间不会运行
         }
 
-        if (fault_.exit_hook != nullptr) {
-            fault_.exit_hook(task_.context);
+        if (fault_.exit != nullptr) {
+            fault_.exit(task_.context);
         }
 
         (void)thread_registry::Remove(this);
@@ -255,21 +230,9 @@ public:
 	}
 
     /**
-     * @brief 设置「保留标记」：Recover 全杀时保留本线程
-     * @param on true=保留
-     */
-    void SetKeepAlive(bool on) override
-	{
-		atomic_set(&run_.keep_alive, on ? 1 : 0);
-	}
-
-    /**
      * @brief 是否带保留标记
      */
-    bool KeepAlive() const override
-	{
-		return atomic_get(&run_.keep_alive) != 0;
-	}
+    bool KeepAlive() const override { return fault_.keep_alive; }
 
     /**
      * @brief 业务侧计数一次丢帧/丢包
@@ -322,7 +285,6 @@ private:
     {
         atomic_t paused      = ATOMIC_INIT(0);   					// 暂停标志
         atomic_t started     = ATOMIC_INIT(0);   					// 是否已创建
-        atomic_t keep_alive  = ATOMIC_INIT(0);   					// Recover 全杀时保留
     } run_;                                      					// 生命周期状态
 
     struct
@@ -335,13 +297,6 @@ private:
 
     struct
     {
-        RetryHook retry_hook   = nullptr;        					// Retry 处理钩子
-        ExitHook  exit_hook    = nullptr;        					// 退出收尾钩子
-        ThreadFaultPolicy policy = ThreadFaultPolicy::Recover;    	// 故障策略（默认按大影响）
-    } fault_;                                    					// 故障处置
-
-    struct
-    {
         atomic_t run_count       = ATOMIC_INIT(0);   				// 任务体进入次数
         atomic_t retry_count     = ATOMIC_INIT(0);   				// 可恢复错误次数
         atomic_t drop_count      = ATOMIC_INIT(0);   				// 业务计数
@@ -349,6 +304,8 @@ private:
         uint64_t max_run_cycles  = 0;                				// 单次最长执行周期（仅工作线程写）
         uint64_t last_run_cycles = 0;                				// 最近一次执行周期（仅工作线程写）
     } stats_;                                    	 				// 运行统计
+
+	ThreadFaultConfig fault_ {};                             		// 故障处置（Start 时由参数定死）
 
     /**
      * @brief 内核线程入口：把 p1 还原成本对象，转入受管外壳
@@ -388,7 +345,7 @@ private:
                 atomic_inc(&stats_.retry_count);
 
                 // 一级：Retry 钩子就地处理（钩子自己决定要不要节流打日志）
-                if (fault_.retry_hook == nullptr || !fault_.retry_hook(task_.context))
+                if (fault_.retry == nullptr || !fault_.retry(task_.context))
                 {
                     // 二级：钩子处理不了 → 默认处置函数直接决定生死（不返回）
                     DefaultHandle(this);

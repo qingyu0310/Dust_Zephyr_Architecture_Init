@@ -2,8 +2,8 @@
  * @file thread_fault.cpp
  * @author qingyu
  * @brief 线程故障默认处置函数的弱实现
- * @version 0.3
- * @date 2026-10-23
+ * @version 0.5
+ * @date 2026-10-24
  *
  * @copyright Copyright (c) 2026
  *

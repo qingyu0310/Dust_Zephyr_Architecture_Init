@@ -31,12 +31,13 @@ AppInit -> AppThread
 
 `init/startup/Init_entry.hpp` 定义：
 
-- `REGISTER_INIT(fn, stage, level, fail, cleanup, name)`：写入 `.user_init`；
-- `REGISTER_THREAD(fn, stage, name)`：写入 `.user_thread`；
+- `REGISTER_INIT(fn, stage, level, fail, rollback, name)`：写入 `.user_init`；
+- `REGISTER_THREAD(fn, stage, fail, name)`：写入 `.user_thread`；
 - `InitStage`、`ThreadStage`：表达执行阶段；
 - `InitLevel`：同阶段内执行顺序（High → Mid → Low）+ 失败处理等级；
-- `InitFailPolicy`：失败后停机（`HaltOnFail`）还是继续（`ContinueOnFail`）；
-- `cleanup`：初始化失败时回滚本项已申请的资源，可为 `nullptr`。
+- `StartFailPolicy`：失败后停机（`HaltOnFail`）还是继续（`ContinueOnFail`）；
+- `rollback`：初始化失败时回滚本项已申请的资源，可为 `nullptr`；
+- `ThreadFaultPolicy`：运行期故障时 `Isolate`（自杀）还是 `Recover`（全杀）。
 
 拥有实现的组件在自己的 `.cpp` 中注册，不需要修改中央启动器。
 
@@ -50,11 +51,11 @@ AppInit -> AppThread
 | `Mid` | 第二轮 | 记录警告，继续启动 |
 | `Low` | 第三轮 | 记录警告，继续启动 |
 
-阶段决定什么时候运行，等级决定同阶段内的先后顺序与失败策略。实际失败行为由 `InitFailPolicy` 决定，`HandleInitFail()` 只区分停机与继续两类。
+阶段决定什么时候运行，等级决定同阶段内的先后顺序与失败策略。实际失败行为由 `StartFailPolicy` 决定，`HandleInitFail()` 只区分停机与继续两类。
 
-初始化失败时启动器**先调该条目的 `cleanup`**（支持部分初始化状态），再走失败策略；`HaltOnFail` 停机前还会**逆序回滚所有已成功项**，把硬件放回安全态（PWM 停输出、Flash 掉电等），最后长鸣并进入休眠停机循环。
+初始化失败时启动器**先调该条目的 `rollback`**（支持部分初始化状态），再走失败策略；`HaltOnFail` 停机前还会**逆序回滚所有已成功项**，把硬件放回安全态（PWM 停输出、Flash 掉电等），最后长鸣并进入休眠停机循环。
 
-线程启动项没有等级，但带 `InitFailPolicy`：启动函数返回 `false` 时，`HaltOnFail` 打印 `[boot] xxx start fail, halting` 并置 `startup_aborted`，后续所有阶段不再执行；`ContinueOnFail` 打印 `[boot] xxx start fail, continue` 后继续启动其它线程。
+线程启动项没有等级，但带 `StartFailPolicy`：启动函数返回 `false` 时，`HaltOnFail` 打印 `[boot] xxx start fail, halting` 并置 `startup_aborted`，后续所有阶段不再执行；`ContinueOnFail` 打印 `[boot] xxx start fail, continue` 后继续启动其它线程。
 
 `System_Startup()` 保证返回，停机策略由 `main.cpp` 查询 `System_StartupAborted()` 后决定。
 
@@ -118,8 +119,11 @@ zephyr_linker_sources(DATA_SECTIONS ../cmd/linker/boot_timing.ld)   # 可写耗�
 | `startup/boot_timing.hpp` | `BootTimingSlot` 结构与耗时槽写入/遍历接口 |
 | `startup/boot_timing.cpp` | `.boot_timing` 段边界遍历实现 |
 | `startup/main.cpp` | 系统入口：启动 + 中止检查 + 空转 |
-| `thread/thread.hpp` | 线程模板：创建、暂停/恢复、受管任务外壳、运行统计 |
+| `thread/thread.hpp` | 线程模板：创建、暂停/恢复、受管任务外壳、运行统计、故障处置与终止 |
+| `thread/thread_fault.hpp` | 故障策略、`ThreadFaultConfig`、钩子类型与 `DefaultHandle` 声明 |
+| `thread/thread_fault.cpp` | `DefaultHandle` 弱实现（`Isolate` 自杀 / `Recover` 全杀） |
 | `thread/thread_registry.hpp` | 已启动线程登记表 |
+| `thread/thread_registry.cpp` | 登记表增删查实现 |
 | `irq/Irq_handlers.h` | CAN RX 注册项和回调声明 |
 | `irq/Irq_handlers.cpp` | CAN RX section 遍历和 ID 分发 |
 | `CMakeLists.txt` | 编译启动实现、加入三个子目录 include、引入链接脚本 |
@@ -237,8 +241,8 @@ AppThread
 `InitEntry` 的核心字段是：
 
 ```text
-function  要调用的 InitFunc
-cleanup   失败回滚与清理回调（可为 nullptr）
+init      要调用的 InitFunc
+rollback  失败回滚回调（可为 nullptr）
 stage     初始化阶段
 level     同阶段执行顺序 + 失败等级
 fail      失败策略：停机 / 继续
