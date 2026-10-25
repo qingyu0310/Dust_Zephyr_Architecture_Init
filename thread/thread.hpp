@@ -162,9 +162,17 @@ public:
      *
      * 自己调用即自杀（内核切走，不返回）；其他线程调用即处决目标线程。
      * 他杀时先挂起目标，亡语期间它不可能再被调度，避免收尾与运行交错。
+     *
+     * 带保留标记（shell）的线程拒绝退出：自杀被他杀都不允许，直接返回。
      */
     void Exit() override
     {
+        if (KeepAlive())                    		// 保留线程（shell）不许自杀/他杀
+        {
+            DUST_LOG_WRN("thread %s is reserved, exit refused", Name());
+            return;
+        }
+
         if (k_current_get() != &thread_) {
             k_thread_suspend(&thread_);     // 他杀：先冻住，亡语期间不会运行
         }
