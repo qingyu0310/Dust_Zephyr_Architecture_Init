@@ -53,9 +53,10 @@ struct ThreadStats
     uint32_t    run_count;          // 任务体进入次数
     uint32_t    retry_count;        // 可恢复错误次数
     uint32_t    drop_count;         // 业务丢帧/丢包计数
-    uint64_t    run_ns;             // 任务体累计执行时间
     uint64_t    max_run_ns;         // 单次最长执行时间
     uint64_t    last_run_ns;        // 最近一次执行时间
+    uint64_t    max_overhead_ns;    // 单次最长外壳开销（已扣除任务体与周期等待）
+    uint64_t    last_overhead_ns;   // 最近一次外壳开销
     uint32_t    stack_unused;       // 栈剩余字节（未开启栈统计时为 0）
     bool        running;            // 线程是否仍在运行
     bool        paused;             // 是否被暂停
@@ -259,9 +260,10 @@ public:
         atomic_clear(&stats_.retry_count);
         atomic_clear(&stats_.drop_count);
 
-        stats_.run_cycles      = 0;
-        stats_.max_run_cycles  = 0;
-        stats_.last_run_cycles = 0;
+        stats_.max_run_cycles         = 0;
+        stats_.last_run_cycles        = 0;
+        stats_.max_overhead_cycles    = 0;
+        stats_.last_overhead_cycles   = 0;
     }
 
     /**
@@ -275,12 +277,13 @@ public:
         out.run_count    = static_cast<uint32_t>(atomic_get(&stats_.run_count));
         out.retry_count  = static_cast<uint32_t>(atomic_get(&stats_.retry_count));
         out.drop_count   = static_cast<uint32_t>(atomic_get(&stats_.drop_count));
-        out.run_ns       = k_cyc_to_ns_floor64(stats_.run_cycles);
-        out.max_run_ns   = k_cyc_to_ns_floor64(stats_.max_run_cycles);
-        out.last_run_ns  = k_cyc_to_ns_floor64(stats_.last_run_cycles);
-        out.running      = IsAlive();
-        out.paused       = Paused();
-        out.stack_unused = StackUnused();
+        out.max_run_ns       = k_cyc_to_ns_floor64(stats_.max_run_cycles);
+        out.last_run_ns      = k_cyc_to_ns_floor64(stats_.last_run_cycles);
+        out.max_overhead_ns  = k_cyc_to_ns_floor64(stats_.max_overhead_cycles);
+        out.last_overhead_ns = k_cyc_to_ns_floor64(stats_.last_overhead_cycles);
+        out.running          = IsAlive();
+        out.paused           = Paused();
+        out.stack_unused     = StackUnused();
 
         return atomic_get(&run_.started) != 0;
     }
@@ -308,9 +311,10 @@ private:
         atomic_t run_count       = ATOMIC_INIT(0);   				// 任务体进入次数
         atomic_t retry_count     = ATOMIC_INIT(0);   				// 可恢复错误次数
         atomic_t drop_count      = ATOMIC_INIT(0);   				// 业务计数
-        uint64_t run_cycles      = 0;                				// 累计执行周期（仅工作线程写）
         uint64_t max_run_cycles  = 0;                				// 单次最长执行周期（仅工作线程写）
         uint64_t last_run_cycles = 0;                				// 最近一次执行周期（仅工作线程写）
+        uint64_t max_overhead_cycles  = 0;           				// 单次最长外壳开销周期（仅工作线程写）
+        uint64_t last_overhead_cycles = 0;           				// 最近一次外壳开销周期（仅工作线程写）
     } stats_;                                    	 				// 运行统计
 
 	ThreadFaultConfig fault_ {};                             		// 故障处置（Start 时由参数定死）
@@ -335,20 +339,22 @@ private:
     {
         for (;;)
         {
-            atomic_inc(&stats_.run_count);
-            const uint64_t begin_cycle = k_cycle_get_64();
+            const uint64_t overhead_begin = k_cycle_get_64();   		// 外壳计时起点：本拍刚开始
+
+            atomic_inc(&stats_.run_count);                      // 进入拍计数
+
+            const uint64_t begin_cycle = k_cycle_get_64();      		// 任务体计时起点
 
             const TaskResult result = task_.entry(task_.context);
 
-            const uint64_t elapsed = k_cycle_get_64() - begin_cycle;
-            stats_.run_cycles += elapsed;
-            stats_.last_run_cycles = elapsed;
+            const uint64_t elapsed = k_cycle_get_64() - begin_cycle;    // 任务体耗时（周期数）
+            stats_.last_run_cycles = elapsed;                   		// 最近一次任务体耗时
 
             if (elapsed > stats_.max_run_cycles) {
-                stats_.max_run_cycles = elapsed;
+                stats_.max_run_cycles = elapsed;                		// 单次最长任务体耗时
             }
 
-            if (result == TaskResult::Retry)
+            if (result == TaskResult::Retry)                    		// 任务要求重试
             {
                 atomic_inc(&stats_.retry_count);
 
@@ -359,14 +365,22 @@ private:
                     DefaultHandle(this);
                 }
             }
-            else if (result == TaskResult::Exit)
+            else if (result == TaskResult::Exit)                		// 任务要求退出
             {
-                DefaultHandle(this);        // 业务要求退出：跳过 RetryHook，直接按策略处置（不返回）
+                DefaultHandle(this);        					   // 业务要求退出：跳过 RetryHook，直接按策略处置（不返回）
             }
 
-            if (!K_TIMEOUT_EQ(task_.period, K_NO_WAIT))
+            // 外壳开销 = 整圈 - 任务体；k_sleep 在下面，不计入
+            const uint64_t overhead_elapsed = k_cycle_get_64() - overhead_begin - elapsed;
+            stats_.last_overhead_cycles = overhead_elapsed;     		// 最近一次外壳开销
+
+            if (overhead_elapsed > stats_.max_overhead_cycles) {
+                stats_.max_overhead_cycles = overhead_elapsed;  		// 单次最长外壳开销
+            }
+
+            if (!K_TIMEOUT_EQ(task_.period, K_NO_WAIT))          // 非 K_NO_WAIT 才等待
 			{
-                k_sleep(task_.period);               // 周期等待
+                k_sleep(task_.period);               		   // 周期等待
             }
         }
     }
