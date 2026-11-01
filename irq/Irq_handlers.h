@@ -12,6 +12,7 @@
 #pragma once
 
 #include <zephyr/drivers/can.h>
+#include <zephyr/toolchain.h>   // _CONCAT：宏内拼接 __COUNTER__ 需要两层展开
 
 // 必须用宏——预处理阶段展开为数字，用于拼接 section 名 ".can_rx1/2/3"
 // constexpr / enum 在编译期才求值，__STRING / ## 拼接时无法展开
@@ -51,8 +52,8 @@ struct CanRxEntry {
 #define _CAN_RX_STR(x)      #x
 #define _CAN_RX_STR2(x)     _CAN_RX_STR(x)
 
-#define CAN_RX_HANDLER(bus_, id_, handler_, name_)                                  \
-    static const CanRxEntry kCanRxEntry_##bus_##_##name_                            \
+#define CAN_RX_HANDLER(bus_, id_, handler_)                                         \
+    static const CanRxEntry _CONCAT(kCanRxEntry_, __COUNTER__)                      \
     __attribute__((used, __section__(".can_rx"                                      \
         _CAN_RX_STR2(bus_)))) = { id_, handler_ }
 
