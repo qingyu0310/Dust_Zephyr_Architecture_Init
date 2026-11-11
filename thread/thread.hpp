@@ -33,7 +33,7 @@ enum class ThreadPrio : uint8_t
 };
 
 /**
- * @brief 线程任务结果（代替异常）
+ * @brief 线程任务结果
  */
 enum class TaskResult : uint8_t
 {
@@ -50,6 +50,7 @@ using TaskFunc = TaskResult (*)(void* context);
 struct ThreadStats
 {
     const char* name;               // 线程名
+	
     uint32_t    run_count;          // 任务体进入次数
     uint32_t    retry_count;        // 可恢复错误次数
     uint32_t    drop_count;         // 业务丢帧/丢包计数
@@ -58,6 +59,7 @@ struct ThreadStats
     uint64_t    max_overhead_ns;    // 单次最长外壳开销（已扣除任务体与周期等待）
     uint64_t    last_overhead_ns;   // 最近一次外壳开销
     uint32_t    stack_unused;       // 栈剩余字节（未开启栈统计时为 0）
+
     bool        running;            // 线程是否仍在运行
     bool        paused;             // 是否被暂停
 };
