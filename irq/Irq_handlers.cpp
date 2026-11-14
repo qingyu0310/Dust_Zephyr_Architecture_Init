@@ -12,6 +12,7 @@
 #include "Irq_handlers.h"
 #include <zephyr/sys/printk.h>
 
+extern const CanRxEntry __can_rx0_start[], __can_rx0_end[];
 extern const CanRxEntry __can_rx1_start[], __can_rx1_end[];
 extern const CanRxEntry __can_rx2_start[], __can_rx2_end[];
 extern const CanRxEntry __can_rx3_start[], __can_rx3_end[];
@@ -26,6 +27,11 @@ static void dispatch(struct can_frame &frame, const CanRxEntry *start, const Can
             return;
         }
     }
+}
+
+void user_can0_rx_callback(struct can_frame &frame, void *)
+{
+    dispatch(frame, __can_rx0_start, __can_rx0_end);
 }
 
 void user_can1_rx_callback(struct can_frame &frame, void *)
